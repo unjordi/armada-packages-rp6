@@ -261,13 +261,29 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://lore.kernel.org/r/20260729110455.641256-1-kuldeep.singh@oss.qualcomm.com
   upstream: https://lore.kernel.org/r/20260729110455.641256-1-kuldeep.singh@oss.qualcomm.com
   notes: Refreshed only its include context for Linux 7.2; runtime-PM and interconnect behavior is unchanged.
-- `patches/0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch`
+- `patches/0507-rpmsg-glink-smem-make-irq-wakeup-capable.patch`
+  source: https://www.mail-archive.com/linux-kernel@vger.kernel.org/msg2569356.html
+  upstream: https://www.mail-archive.com/linux-kernel@vger.kernel.org/msg2569356.html
+  notes: Deepak Kumar Singh's "rpmsg: glink: Make glink smem interrupt wakeup
+  capable". Replaces 0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram
+  (see below). Instead of masking the IPCC summary irq in S2RAM -- which let
+  SM8550/kalama enter deep suspend but silenced the charger doorbell, so the
+  device would not charge while asleep -- this makes the glink-smem irq
+  wakeup-capable: drop IRQF_NO_SUSPEND (keep IRQF_NO_AUTOEN), add
+  device_init_wakeup + dev_pm_set_wake_irq (and the teardown on unregister). A
+  charger-plug doorbell now wakes the AP, battmgr processes it, and the system
+  re-suspends -- deep suspend AND charging, no trade-off. This is the upstream /
+  QTI-downstream approach used by kalama OEM kernels. Applies clean on 7.2.3
+  (verified with `patch -p1 --dry-run` and `git apply --check`).
+- ~~`patches/0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch`~~
+  REMOVED (2026-09-15): dropped from patches/series, replaced by 0507 above.
   source: https://github.com/ROCKNIX/distribution/commit/f955f5b6137554253e4d52bbe72f9b4936fb253d
   upstream: not submitted
   notes: Reworked from ROCKNIX's blanket IRQF_NO_SUSPEND removal: the summary
-  irq is masked (unlazy) only for suspend-to-RAM on the SM8550/SM8750
-  compatibles, so suspend-to-idle keeps the doorbell live and charging can
-  start while asleep.
+  irq was masked (unlazy) only for suspend-to-RAM on the SM8550/SM8750
+  compatibles. This masking silenced the charger doorbell during S2RAM, so the
+  device entered deep suspend but did not charge while asleep -- the trade-off
+  that 0507 removes by making the glink-smem irq wakeup-capable instead.
 - `patches/0505-msm_gem-lock-before-put_iova_spaces.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/patches/linux/0505-msm_gem-lock-before-put_iova_spaces.patch
   upstream: unknown

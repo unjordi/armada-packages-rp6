@@ -1,0 +1,65 @@
+From: Deepak Kumar Singh <quic_deesin@quicinc.com>
+Subject: [PATCH] rpmsg: glink: Make glink smem interrupt wakeup capable
+
+There are certain usecases which require glink interrupt to be wakeup
+capable. For example if handset is in sleep state and usb charger is
+plugged in, dsp wakes up and sends glink interrupt to host for glink
+pmic channel communication. Glink is suppose to wakeup host processor
+completely for further glink data handling. IRQF_NO_SUSPEND does not
+gurantee complete wakeup, system may again enter sleep after interrupt
+handling and glink data may not be handled by pmic client driver.
+
+To ensure data handling by client configure glink smem device as wakeup
+source and attach glink interrupt as wakeup irq. Remove IRQF_NO_SUSPEND
+flag as it is no longer required.
+
+Signed-off-by: Deepak Kumar Singh <quic_deesin@quicinc.com>
+
+[armada] Imported to replace 0504-mailbox-qcom-ipcc-mask-summary-irq-
+for-suspend-to-ram.patch. That patch let SM8550/kalama enter deep
+suspend-to-RAM but masked the IPCC summary IRQ, which also killed the
+charger doorbell while asleep (deep-suspend XOR charging). Making the
+glink-smem IRQ wakeup-capable is the upstream / QTI-downstream approach
+used by kalama OEM kernels: a real charger-plug doorbell wakes the AP,
+battmgr processes it, and the system re-suspends -- deep suspend AND
+charging, no trade-off.
+
+Origin: https://www.mail-archive.com/linux-kernel@vger.kernel.org/msg2569356.html
+--- a/drivers/rpmsg/qcom_glink_smem.c
++++ b/drivers/rpmsg/qcom_glink_smem.c
+@@ -22,6 +22,7 @@
+ #include <linux/regmap.h>
+ #include <linux/workqueue.h>
+ #include <linux/list.h>
++#include <linux/pm_wakeirq.h>
+ 
+ #include <linux/rpmsg/qcom_glink.h>
+ 
+@@ -306,8 +307,7 @@
+ 
+ 	smem->irq = of_irq_get(smem->dev.of_node, 0);
+ 	ret = devm_request_irq(&smem->dev, smem->irq, qcom_glink_smem_intr,
+-			       IRQF_NO_SUSPEND | IRQF_NO_AUTOEN,
+-			       "glink-smem", smem);
++			       IRQF_NO_AUTOEN, "glink-smem", smem);
+ 	if (ret) {
+ 		dev_err(&smem->dev, "failed to request IRQ\n");
+ 		goto err_put_dev;
+@@ -346,6 +346,8 @@
+ 
+ 	smem->glink = glink;
+ 
++	device_init_wakeup(dev, true);
++	dev_pm_set_wake_irq(dev, smem->irq);
+ 	enable_irq(smem->irq);
+ 
+ 	return smem;
+@@ -365,6 +367,8 @@
+ 	struct qcom_glink *glink = smem->glink;
+ 
+ 	disable_irq(smem->irq);
++	dev_pm_clear_wake_irq(&smem->dev);
++	device_init_wakeup(&smem->dev, false);
+ 
+ 	qcom_glink_native_remove(glink);
+ 
