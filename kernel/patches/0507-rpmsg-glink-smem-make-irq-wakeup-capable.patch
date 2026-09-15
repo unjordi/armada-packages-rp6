@@ -24,6 +24,26 @@ used by kalama OEM kernels: a real charger-plug doorbell wakes the AP,
 battmgr processes it, and the system re-suspends -- deep suspend AND
 charging, no trade-off.
 
+[armada] Implicit dependency (FMEA MEDIUM): enable_irq_wake(smem->irq)
+does not arm any HW wake bit by itself -- the IPCC irqchip carries
+IRQCHIP_SKIP_SET_WAKE and implements no .irq_set_wake, so this call is a
+no-op at the irqchip level. The actual wake capability comes ENTIRELY
+from two conditions outside this patch: (1) the IPCC summary irq is
+still requested IRQF_NO_SUSPEND, and (2) SM8550 never power-collapses
+the GIC in S2RAM. If either changes later -- summary irq made
+suspend-capable, or GIC power-collapse enabled for S2RAM -- this wakeup
+breaks SILENTLY (system goes back to 0W deep suspend with no error).
+QA note: after any suspend/resume change on SM8550, confirm the wakeup
+is attributed to glink-smem in /sys/kernel/debug/wakeup_sources.
+
+[armada] Blast radius (FMEA MEDIUM): this patch is deliberately GLOBAL --
+it makes the glink-smem edge wakeup-capable for every family this kernel
+builds (SM8250/SM8550/SM8650/SM8750), unlike the removed 0504-mask patch
+below, which only touched qcom,sm8550-ipcc/qcom,sm8750-ipcc via
+of_device_is_compatible. Before a multi-device release, run a suspend
+smoke test on at least one non-SM8550 device (RP5/Mini/Flip2 = SM8250,
+Pocket S2/FIT = SM8650) to confirm no regression there.
+
 Origin: https://www.mail-archive.com/linux-kernel@vger.kernel.org/msg2569356.html
 --- a/drivers/rpmsg/qcom_glink_smem.c
 +++ b/drivers/rpmsg/qcom_glink_smem.c

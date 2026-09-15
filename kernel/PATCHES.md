@@ -275,6 +275,18 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   re-suspends -- deep suspend AND charging, no trade-off. This is the upstream /
   QTI-downstream approach used by kalama OEM kernels. Applies clean on 7.2.3
   (verified with `patch -p1 --dry-run` and `git apply --check`).
+  Implicit dependency (FMEA MEDIUM): enable_irq_wake() on smem->irq is a
+  no-op at the irqchip level (IPCC carries IRQCHIP_SKIP_SET_WAKE, no
+  .irq_set_wake) -- the actual wake capability rests entirely on (1) the
+  IPCC summary irq staying IRQF_NO_SUSPEND and (2) SM8550 never
+  power-collapsing the GIC in S2RAM. Touching either later breaks this
+  wakeup silently; QA should confirm glink-smem shows up in
+  /sys/kernel/debug/wakeup_sources after any suspend-path change.
+  Blast radius (FMEA MEDIUM): unlike the removed 0504 patch (scoped to
+  qcom,sm8550-ipcc/qcom,sm8750-ipcc), this one is global to every family
+  this kernel builds (SM8250/SM8550/SM8650/SM8750) -- needs a suspend
+  smoke test on a non-SM8550 device (SM8250: RP5/Mini/Flip2; SM8650:
+  Pocket S2/FIT) before a multi-device release.
 - ~~`patches/0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch`~~
   REMOVED (2026-09-15): dropped from patches/series, replaced by 0507 above.
   source: https://github.com/ROCKNIX/distribution/commit/f955f5b6137554253e4d52bbe72f9b4936fb253d
