@@ -93,7 +93,13 @@
 # ============== SoC / Platform ==============
 20260424_neil_armstrong_arm64_dts_qcom_sm8_456_50_add_missing_cx_power_domain_to_gcc.patch
 v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
-0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch
+# 0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch  -- REMOVED:
+#   The IPCC summary-irq mask let SM8550 enter suspend-to-RAM but silenced
+#   the ADSP charger doorbell in deep -> no charging while asleep. Reverted
+#   to the mainline glink/IPCC transport (summary irq IRQF_NO_SUSPEND, no
+#   mask); the wakeup decision now lives client-side in qcom_battmgr, see
+#   0903/0904 below. (0507 whole-edge glink-smem wakeup is likewise not used
+#   here: it woke on every ADSP doorbell -> wake-storm.)
 0505-msm_gem-lock-before-put_iova_spaces.patch
 0204-thermal-qcom-tsens-mask-lower-threshold-irqs-across-suspend.patch
 0510-soc-qcom-ice-unwind-clocks-on-resume-failure.patch
