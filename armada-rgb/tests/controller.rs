@@ -112,6 +112,7 @@ fn enabled(color: &str, brightness: u8) -> LightingConfig {
         brightness,
         color: color.into(),
         correction: None,
+        ..LightingConfig::default()
     }
 }
 

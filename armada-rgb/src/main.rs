@@ -1,7 +1,7 @@
 //! Command line interface for RGB lighting.
 
 use anyhow::Result;
-use armada_rgb::{ColorCorrection, Controller, LightingConfig};
+use armada_rgb::{ColorCorrection, Controller, Effect, LightingConfig};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -26,11 +26,24 @@ enum Command {
         /// RGB correction trigger and channel reductions.
         #[arg(long, value_name = "TRIGGER:RED,GREEN,BLUE")]
         correction: Option<ColorCorrection>,
+        /// Animation: static, breathing, color_cycle, rainbow, load, battery.
+        #[arg(long, value_parser = parse_effect)]
+        effect: Option<Effect>,
+        /// Animation speed as a percentage (100 = default).
+        #[arg(long)]
+        speed: Option<u16>,
     },
     /// Turn the stick lights off and save that state.
     Off,
     /// Apply the saved configuration.
     Apply,
+    /// Run the lighting daemon: keep the saved configuration painted, animate
+    /// the selected effect, and reload live when the config changes.
+    Run,
+}
+
+fn parse_effect(value: &str) -> Result<Effect, String> {
+    value.parse()
 }
 
 fn main() -> Result<()> {
@@ -51,6 +64,8 @@ fn main() -> Result<()> {
             color,
             brightness,
             correction,
+            effect,
+            speed,
         } => {
             let mut config: LightingConfig = controller.get()?;
             config.enabled = true;
@@ -58,6 +73,12 @@ fn main() -> Result<()> {
             config.brightness = brightness;
             if let Some(correction) = correction {
                 config.correction = Some(correction);
+            }
+            if let Some(effect) = effect {
+                config.effect = effect;
+            }
+            if let Some(speed) = speed {
+                config.speed = speed;
             }
             let config: LightingConfig = controller.set(config)?;
             println!("{}", serde_json::to_string_pretty(&config)?);
@@ -70,6 +91,9 @@ fn main() -> Result<()> {
             if let Some(reason) = controller.apply()? {
                 eprintln!("RGB unsupported: {reason}");
             }
+        }
+        Command::Run => {
+            controller.run()?;
         }
     }
     Ok(())
