@@ -108,6 +108,9 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 0122-interconnect__qcom__sm8550__Enable_QoS_configuration.patch
 0200-ASoC-wcd938x-add-DMIC-DAPM-inputs.patch
 
+# ============== WiFi ==============
+1020-wifi-ath12k-send-the-computed-scan-priority-to-the-f.patch
+
 # ============== System tweaks ==============
 0500-ROCKNIX-set-boot-fanspeed.patch
 0501-ROCKNIX-fix-wifi-and-bt-mac.patch
