@@ -1,0 +1,60 @@
+From: unjordi <jordi@ciencias.unam.mx>
+Subject: [PATCH] power: supply: qcom_battmgr: don't hold a system wakeup source
+ on routine notifications
+
+The pmic_glink battery manager registers its battery/USB/wireless power
+supplies through the power-supply core, which by default marks each of
+them as a system wakeup source. Every power_supply_changed() then calls
+pm_stay_awake() on the supply's device.
+
+While a charger is attached the ADSP streams routine telemetry
+(state-of-charge, current, temperature, tapering) as a continuous run of
+NOTIF_BAT_PROPERTY doorbells, each of which lands in
+power_supply_changed(). On QCS8550/kalama-class parts (no modem; the
+charger lives entirely in the ADSP) this keeps a wakeup source
+perpetually held while charging, which both blocks the AP from entering
+suspend just because a cable is plugged in, and -- the working
+hypothesis, to be confirmed by the on-device residency measurement --
+contributes to suspend-to-RAM aborting on an "unattributed" wakeup at
+entry.
+
+Register the battmgr supplies with no_wakeup_source so routine telemetry
+no longer holds a system wakeup source. A genuine charger attach/detach
+is still woken selectively (see the follow-up patch that arms a wakeup
+event only on the USB/WLS charger notifications). This does not touch the
+ucsi-source-psy, which is owned by ucsi_glink.
+
+This replaces the previous transport-level approaches on these boards:
+the 0504 IPCC summary-irq mask (entered deep but silenced the charger
+doorbell -> no charge while asleep) and the 0507 whole-edge glink-smem
+wakeup (woke on every ADSP doorbell -> wake-storm). Both are dropped from
+the series; the glink/IPCC transport returns to mainline (summary irq
+IRQF_NO_SUSPEND, no mask), and wakeup is decided in the battmgr client.
+
+Signed-off-by: unjordi <jordi@ciencias.unam.mx>
+---
+ drivers/power/supply/qcom_battmgr.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -1654,6 +1654,18 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	psy_cfg_supply.supplied_to = qcom_battmgr_battery;
+ 	psy_cfg_supply.num_supplicants = 1;
+ 
++	/*
++	 * battmgr's psy notifications are routine telemetry (SOC, current,
++	 * temperature, tapering) that the ADSP pushes continuously while a
++	 * charger is attached. Holding a system wakeup source on each of
++	 * them keeps the AP from entering (and staying in) suspend-to-RAM
++	 * for no good reason. Register the supplies without a wakeup
++	 * source; a genuine charger attach/detach is woken selectively by
++	 * the notification handler instead.
++	 */
++	psy_cfg.no_wakeup_source = true;
++	psy_cfg_supply.no_wakeup_source = true;
++
+ 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
+ 	mutex_init(&battmgr->lock);
+ 	init_completion(&battmgr->ack);
