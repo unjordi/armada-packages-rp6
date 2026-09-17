@@ -264,10 +264,15 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch`
   source: https://github.com/ROCKNIX/distribution/commit/f955f5b6137554253e4d52bbe72f9b4936fb253d
   upstream: not submitted
-  notes: Reworked from ROCKNIX's blanket IRQF_NO_SUSPEND removal: the summary
-  irq is masked (unlazy) only for suspend-to-RAM on the SM8550/SM8750
-  compatibles, so suspend-to-idle keeps the doorbell live and charging can
-  start while asleep.
+  status: DROPPED FROM THE SERIES (2026-09-17) — superseded by the client-side battmgr
+  wakeup (0903/0904). The file is kept in patches/ for reference but is NOT in `series`.
+  notes: Reworked from ROCKNIX's blanket IRQF_NO_SUSPEND removal, it masked the IPCC
+  summary irq (unlazy) for suspend-to-RAM on SM8550/SM8750 so s2idle kept the doorbell
+  live. In deep (S2RAM) the mask silenced the charger doorbell too -> entered deep but
+  DID NOT charge. Replaced by leaving the transport at mainline (summary irq
+  IRQF_NO_SUSPEND, no mask) and deciding wakeup in the battmgr client (0903 + 0904).
+  The whole-edge glink-smem wakeup approach (Deepak's 0507) was also tried and dropped:
+  it woke on every ADSP doorbell -> wake-storm.
 - `patches/0505-msm_gem-lock-before-put_iova_spaces.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/patches/linux/0505-msm_gem-lock-before-put_iova_spaces.patch
   upstream: unknown
@@ -331,6 +336,25 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local
   notes: Armada wrote this diagnostic patch to log the USB type and Qualcomm firmware's adapter type when either value changes.
+- `patches/0903-power-supply-qcom-battmgr-dont-hold-wakeup-source-on-routine-notifications.patch`
+  source: armada (unjordi)
+  upstream: not submitted (candidate; novel-but-accepted pattern)
+  notes: P1 of the deep-suspend charging fix. Registers the battmgr battery/USB/wireless
+  power supplies with no_wakeup_source=true so routine telemetry (NOTIF_BAT_PROPERTY,
+  streamed continuously while charging) no longer holds a system wakeup source via
+  power_supply_changed()->pm_stay_awake(). Fixes req#3 (a cable no longer keeps the AP
+  from suspending) and removes the second wake-storm source. Pairs with 0904.
+- `patches/0904-power-supply-qcom-battmgr-wake-on-charger-attach-detach.patch`
+  source: armada (unjordi)
+  upstream: not submitted (candidate; mirrors the ucsi_glink client-side wakeup adopted upstream)
+  notes: P2 of the deep-suspend charging fix. Marks the battmgr device wakeup-capable
+  (device_init_wakeup) and arms a short hard pm_wakeup_dev_event only on the charger
+  notification class -- NOTIF_USB_PROPERTY (0x32) and NOTIF_WLS_PROPERTY (0x34) -- never
+  on NOTIF_BAT_PROPERTY (0x30) telemetry, so a charger attach/detach wakes the AP long
+  enough to service the charge handshake without re-introducing the storm. Obligate pair
+  with 0903. Open item (measurement-gated): if the ADSP proves to push NOTIF_USB
+  repeatedly during active PD charging at mid-SOC (re-storm via the USB door), narrow to
+  waking only on the usb.online transition (cache online state in the response path).
 - `patches/0001-pcie-update-sm8650-dtsi.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8650/patches/linux/0001-pcie-update-sm8650-dtsi.patch
   upstream: https://lore.kernel.org/r/20260611-wake-v2-35-2744251b1181@oss.qualcomm.com

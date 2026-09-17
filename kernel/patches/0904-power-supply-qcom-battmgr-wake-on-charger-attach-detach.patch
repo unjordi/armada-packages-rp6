@@ -1,0 +1,83 @@
+From: unjordi <jordi@ciencias.unam.mx>
+Subject: [PATCH] power: supply: qcom_battmgr: wake on charger attach/detach
+
+With the battmgr supplies registered without a wakeup source, routine
+battery telemetry no longer wakes the AP -- but a charger attach or
+detach must still wake it long enough to service the charge-start
+handshake before it re-suspends. On QCS8550/kalama-class parts the
+charger is handled entirely in the ADSP and the AP has no dedicated
+charger IRQ; the only wake path is the glink doorbell, and ucsi_glink in
+this tree carries no wakeup logic of its own, so the battmgr client must
+provide it.
+
+Mark the battmgr device wakeup-capable and, in the notification handler,
+arm a short hard wakeup event only on the charger/connector notification
+class -- NOTIF_USB_PROPERTY (0x32) and NOTIF_WLS_PROPERTY (0x34) -- and
+never on NOTIF_BAT_PROPERTY (0x30), which is the high-rate telemetry that
+constitutes the storm. This mirrors the client-side wakeup pattern that
+upstream adopted for ucsi_glink (device_init_wakeup() + a bounded
+pm_wakeup event on the connector event), applied to the battmgr client.
+
+The USB/WLS notification class fires on plug/unplug and PD contract
+changes, which are infrequent, so this wakes on a real charger event
+without re-introducing the telemetry storm. A finer filter (waking only
+when usb.online actually toggles) is possible but needs cached online
+state; the notification-class scoping already excludes the telemetry
+that caused the storm.
+
+Signed-off-by: unjordi <jordi@ciencias.unam.mx>
+---
+ drivers/power/supply/qcom_battmgr.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -9,6 +9,7 @@
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of_device.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+ #include <linux/soc/qcom/pdr.h>
+@@ -34,6 +35,13 @@ enum qcom_battmgr_variant {
+ #define NOTIF_BAT_PROPERTY		0x30
+ #define NOTIF_USB_PROPERTY		0x32
+ #define NOTIF_WLS_PROPERTY		0x34
++
++/*
++ * Hold a wakeup source briefly across a charger attach/detach so the AP
++ * stays up long enough to service the charge-start handshake before it
++ * re-enters suspend.
++ */
++#define QCOM_BATTMGR_WAKEUP_MS		50
+ #define NOTIF_BAT_STATUS		0x80
+ #define NOTIF_BAT_INFO			0x81
+ #define NOTIF_BAT_CHARGING_STATE	0x83
+@@ -1214,9 +1222,11 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 		power_supply_changed(battmgr->bat_psy);
+ 		break;
+ 	case NOTIF_USB_PROPERTY:
++		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
+ 		power_supply_changed(battmgr->usb_psy);
+ 		break;
+ 	case NOTIF_WLS_PROPERTY:
++		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
+ 		power_supply_changed(battmgr->wls_psy);
+ 		break;
+ 	default:
+@@ -1737,6 +1747,13 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 					     "failed to register wireless charing power supply\n");
+ 	}
+ 
++	/*
++	 * Wake the AP on a charger attach/detach (the USB/WLS notifications
++	 * handled above); the routine battery telemetry is left to the
++	 * supplies, which are registered without a wakeup source.
++	 */
++	device_init_wakeup(dev, true);
++
+ 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
+ 						       qcom_battmgr_callback,
+ 						       qcom_battmgr_pdr_notify,
