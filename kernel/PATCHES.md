@@ -335,6 +335,8 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0900-power-supply-qcom-battmgr-log-usb-adapter-type.patch`
   source: armada
   upstream: local
+  status: NOT IN THE SERIES — diagnostic only. The file is kept in patches/ for
+  reference but is not listed in `series`, so it is not applied to shipped builds.
   notes: Armada wrote this diagnostic patch to log the USB type and Qualcomm firmware's adapter type when either value changes.
 - `patches/0903-power-supply-qcom-battmgr-dont-hold-wakeup-source-on-routine-notifications.patch`
   source: armada (unjordi)
