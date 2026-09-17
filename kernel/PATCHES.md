@@ -261,18 +261,19 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: https://lore.kernel.org/r/20260729110455.641256-1-kuldeep.singh@oss.qualcomm.com
   upstream: https://lore.kernel.org/r/20260729110455.641256-1-kuldeep.singh@oss.qualcomm.com
   notes: Refreshed only its include context for Linux 7.2; runtime-PM and interconnect behavior is unchanged.
-- `patches/0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch`
+- `0504-mailbox-qcom-ipcc-mask-summary-irq-for-suspend-to-ram.patch` — REMOVED 2026-09-17
   source: https://github.com/ROCKNIX/distribution/commit/f955f5b6137554253e4d52bbe72f9b4936fb253d
-  upstream: not submitted
-  status: DROPPED FROM THE SERIES (2026-09-17) — superseded by the client-side battmgr
-  wakeup (0903/0904). The file is kept in patches/ for reference but is NOT in `series`.
+  upstream: not submitted (downstream-only workaround)
+  status: DELETED from the tree — obsoleted by the client-side battmgr wakeup (0903 + 0904).
+  Kept here only as a historical note for the upstream submission.
   notes: Reworked from ROCKNIX's blanket IRQF_NO_SUSPEND removal, it masked the IPCC
   summary irq (unlazy) for suspend-to-RAM on SM8550/SM8750 so s2idle kept the doorbell
   live. In deep (S2RAM) the mask silenced the charger doorbell too -> entered deep but
-  DID NOT charge. Replaced by leaving the transport at mainline (summary irq
-  IRQF_NO_SUSPEND, no mask) and deciding wakeup in the battmgr client (0903 + 0904).
-  The whole-edge glink-smem wakeup approach (Deepak's 0507) was also tried and dropped:
-  it woke on every ADSP doorbell -> wake-storm.
+  DID NOT charge. The fix now leaves the transport at mainline (summary irq
+  IRQF_NO_SUSPEND, no mask) and makes the wakeup decision client-side in qcom_battmgr
+  (0903 no-hold on routine notifications + 0904 wake on charger attach/detach). The
+  whole-edge glink-smem approach (Deepak's 0507) was also tried and dropped: it woke on
+  every ADSP doorbell -> wake-storm.
 - `patches/0505-msm_gem-lock-before-put_iova_spaces.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8250/patches/linux/0505-msm_gem-lock-before-put_iova_spaces.patch
   upstream: unknown
