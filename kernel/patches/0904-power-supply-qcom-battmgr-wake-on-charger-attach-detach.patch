@@ -18,6 +18,17 @@ constitutes the storm. This mirrors the client-side wakeup pattern that
 upstream adopted for ucsi_glink (device_init_wakeup() + a bounded
 pm_wakeup event on the connector event), applied to the battmgr client.
 
+The device is made wakeup-capable with devm_device_init_wakeup() rather
+than a bare device_init_wakeup(dev, true): qcom_battmgr is tristate
+(CONFIG_BATTERY_QCOM_BATTMGR=m on these boards), and the plain call
+leaves the wakeup source enabled after the driver unbinds. The devm
+variant registers a teardown action so the wakeup source is released on
+unbind/module removal, matching the all-devm resource handling already
+used by this probe. Its return is checked (it can fail allocating the
+devm action) and surfaced through dev_err_probe(), like the neighbouring
+registrations. devm_device_init_wakeup() is available since Linux 6.15
+and is present in this tree's 7.2.3 base.
+
 The USB/WLS notification class fires on plug/unplug and PD contract
 changes, which are infrequent, so this wakes on a real charger event
 without re-introducing the telemetry storm. A finer filter (waking only
@@ -27,8 +38,8 @@ that caused the storm.
 
 Signed-off-by: unjordi <jordi@ciencias.unam.mx>
 ---
- drivers/power/supply/qcom_battmgr.c | 17 +++++++++++++++++
- 1 file changed, 17 insertions(+)
+ drivers/power/supply/qcom_battmgr.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
 
 diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
 --- a/drivers/power/supply/qcom_battmgr.c
@@ -67,16 +78,20 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  		power_supply_changed(battmgr->wls_psy);
  		break;
  	default:
-@@ -1737,6 +1747,13 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+@@ -1737,6 +1747,17 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
  					     "failed to register wireless charing power supply\n");
  	}
  
 +	/*
 +	 * Wake the AP on a charger attach/detach (the USB/WLS notifications
 +	 * handled above); the routine battery telemetry is left to the
-+	 * supplies, which are registered without a wakeup source.
++	 * supplies, which are registered without a wakeup source. Use the
++	 * devm variant so the wakeup source is torn down automatically when
++	 * the module is unbound (battmgr is tristate).
 +	 */
-+	device_init_wakeup(dev, true);
++	ret = devm_device_init_wakeup(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to enable wakeup\n");
 +
  	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
  						       qcom_battmgr_callback,
