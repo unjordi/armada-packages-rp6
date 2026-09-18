@@ -125,6 +125,7 @@ impl ChannelBackend {
 
         for (name, channel) in channels {
             let path: PathBuf = self.root.join(&name);
+            reclaim_led(&path);
             let brightness_path: PathBuf = path.join("brightness");
             let brightness: File = OpenOptions::new()
                 .write(true)
@@ -193,6 +194,7 @@ impl MulticolorBackend {
 
         for name in &self.targets {
             let path: PathBuf = self.root.join(name);
+            reclaim_led(&path);
             let brightness_path: PathBuf = path.join("brightness");
             let blank: File = OpenOptions::new()
                 .write(true)
@@ -249,6 +251,7 @@ impl MulticolorBackend {
                 None => rgb,
             };
             let path: PathBuf = self.root.join(name);
+            reclaim_led(&path);
             let order: Vec<String> = read_order(&path.join("multi_index"))?;
             let maximum: u32 = read_maximum(&path.join("max_brightness"))?;
             let values: Vec<String> = order
@@ -335,6 +338,33 @@ fn write_attr(file: &mut File, value: &str) -> std::io::Result<()> {
     let output: String = format!("{value}\n");
     file.write_all(output.as_bytes())?;
     file.flush()
+}
+
+/// Reclaim an LED from a kernel trigger before the daemon drives it.
+///
+/// The suspend charge-indicator hand-off (armada#26) arms a kernel
+/// `<psy>-charging-orange-full-green` trigger on these nodes while the device
+/// sleeps -- so the charge state keeps painting through deep sleep with no CPU
+/// -- and the resume hook disarms it (writes `none`) before the daemon runs.
+/// A LED whose trigger is still armed is treated as "not ours": the only time
+/// the daemon should meet one is leftover from a crash that skipped the resume
+/// hook, so we disarm it here before writing, otherwise the kernel trigger
+/// would keep overriding our brightness. Best-effort: nodes with no `trigger`
+/// attribute, or one already `none`, are left untouched, and any error is
+/// ignored (lighting is cosmetic).
+fn reclaim_led(led_dir: &Path) {
+    let trigger_path: PathBuf = led_dir.join("trigger");
+    let Ok(contents) = fs::read_to_string(&trigger_path) else {
+        return;
+    };
+    // The active trigger is the token wrapped in brackets, e.g.
+    // "none rc-feedback [battery-charging-orange-full-green] timer".
+    let active: Option<&str> = contents
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix('[').and_then(|t| t.strip_suffix(']')));
+    if matches!(active, Some(name) if name != "none") {
+        let _ = fs::write(&trigger_path, b"none\n");
+    }
 }
 
 fn read_order(path: &Path) -> Result<Vec<String>> {
@@ -425,6 +455,27 @@ fn scale(percent: u8, maximum: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_led(trigger: Option<&str>) -> PathBuf {
+        let nonce: u128 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir: PathBuf = std::env::temp_dir().join(format!(
+            "rgb-reclaim-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        if let Some(contents) = trigger {
+            fs::write(dir.join("trigger"), contents).unwrap();
+        }
+        dir
+    }
 
     #[test]
     fn scales_channels_and_brightness() {
@@ -432,5 +483,32 @@ mod tests {
         assert_eq!(gamma(128, 100), 22);
         assert_eq!(gamma(255, 255), 255);
         assert_eq!(scale(25, 255), 64);
+    }
+
+    #[test]
+    fn reclaims_an_armed_trigger() {
+        let dir: PathBuf = temp_led(Some(
+            "none rc-feedback [battery-charging-orange-full-green] timer\n",
+        ));
+        reclaim_led(&dir);
+        assert_eq!(fs::read_to_string(dir.join("trigger")).unwrap(), "none\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leaves_a_disarmed_trigger_untouched() {
+        let contents: &str = "[none] rc-feedback battery-charging-orange-full-green timer\n";
+        let dir: PathBuf = temp_led(Some(contents));
+        reclaim_led(&dir);
+        assert_eq!(fs::read_to_string(dir.join("trigger")).unwrap(), contents);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignores_a_node_without_a_trigger_attribute() {
+        let dir: PathBuf = temp_led(None);
+        reclaim_led(&dir); // must not panic or create the file
+        assert!(!dir.join("trigger").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
