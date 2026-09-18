@@ -11,6 +11,9 @@ const MODEL_PATH: &str = "/sys/firmware/devicetree/base/model";
 const PROFILE_VERSION: u32 = 1;
 const PROFILES_PATH: &str = "/usr/share/armada-rgb/profiles.json";
 const SYSFS_ROOT: &str = "/sys/class/leds";
+/// Tmpfs on purpose: a "charging indicator on" pin left over from a crash
+/// mid-suspend must not survive a reboot into a fresh session.
+const CHARGE_PATH: &str = "/run/armada-rgb/charge.json";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +55,12 @@ pub(crate) fn from_env() -> (PathBuf, LightingBackend) {
     let backend: LightingBackend = load_backend(&profiles_path, &model_path, sysfs_root)
         .unwrap_or_else(|error| LightingBackend::Unsupported(format!("{error:#}")));
     (config_path, backend)
+}
+
+pub(crate) fn charge_path_from_env() -> PathBuf {
+    env::var_os("ARMADA_RGB_CHARGE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| CHARGE_PATH.into())
 }
 
 fn load_backend(profiles_path: &Path, model_path: &Path, root: PathBuf) -> Result<LightingBackend> {
