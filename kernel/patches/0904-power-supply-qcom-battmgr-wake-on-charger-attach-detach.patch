@@ -1,22 +1,47 @@
 From: unjordi <jordi@ciencias.unam.mx>
-Subject: [PATCH] power: supply: qcom_battmgr: wake on charger attach/detach
+Subject: [PATCH] power: supply: qcom_battmgr: wake only on a real charger
+ attach/detach
 
-With the battmgr supplies registered without a wakeup source, routine
-battery telemetry no longer wakes the AP -- but a charger attach or
-detach must still wake it long enough to service the charge-start
-handshake before it re-suspends. On QCS8550/kalama-class parts the
-charger is handled entirely in the ADSP and the AP has no dedicated
-charger IRQ; the only wake path is the glink doorbell, and ucsi_glink in
-this tree carries no wakeup logic of its own, so the battmgr client must
-provide it.
+With the battmgr supplies registered without a wakeup source (0903),
+routine battery telemetry no longer wakes the AP -- but a charger
+attach or detach must still wake it long enough to service the
+charge-start handshake before it re-suspends. On QCS8550/kalama-class
+parts the charger is handled entirely in the ADSP and the AP has no
+dedicated charger IRQ; the only wake path is the glink doorbell, and
+ucsi_glink in this tree carries no wakeup logic of its own, so the
+battmgr client must provide it.
 
-Mark the battmgr device wakeup-capable and, in the notification handler,
-arm a short hard wakeup event only on the charger/connector notification
-class -- NOTIF_USB_PROPERTY (0x32) and NOTIF_WLS_PROPERTY (0x34) -- and
-never on NOTIF_BAT_PROPERTY (0x30), which is the high-rate telemetry that
-constitutes the storm. This mirrors the client-side wakeup pattern that
-upstream adopted for ucsi_glink (device_init_wakeup() + a bounded
-pm_wakeup event on the connector event), applied to the battmgr client.
+A first version of this patch armed a wakeup event on every
+NOTIF_USB_PROPERTY/NOTIF_WLS_PROPERTY notification (the charger
+notification class, as opposed to NOTIF_BAT_PROPERTY's routine
+telemetry). That was too coarse: on-device testing at mid-SOC with an
+active PD charge showed the ADSP pushes NOTIF_USB_PROPERTY repeatedly
+while charging (current/voltage/type telemetry rides the same
+notification class as an actual plug event, not just NOTIF_BAT_PROPERTY),
+so every one of those re-armed a hard wakeup and the AP never managed
+to re-enter suspend -- a wake-storm through the USB door instead of the
+transport-level one 0903/this series already closed.
+
+Replace the blanket wake with one gated on whether usb.online/
+wireless.online actually changed. qcom_battmgr_notification() runs on
+the glink RX path with channel->recv_lock held (qcom_glink_rx_data() in
+qcom_glink_native.c calls the rpmsg callback under that spinlock), so it
+cannot itself block on the firmware round trip needed to read a fresh
+online value (qcom_battmgr_request() sleeps on a completion). Defer that
+off the RX path instead: the notification handler schedules a work item,
+which re-queries ONLINE via the same qcom_battmgr_usb_sm8350_update()/
+qcom_battmgr_wls_sm8350_update() calls sysfs already uses, and arms a
+short hard pm_wakeup_dev_event() only when the value flipped from what
+was last armed. Routine telemetry notifications resolve to "unchanged"
+and arm nothing; a genuine attach/detach flips the cached value and
+wakes the AP once. If the off-path query itself fails (firmware busy or
+timed out), fall back to waking unconditionally rather than risk
+silently swallowing a real transition.
+
+SC8280XP/X1E80100 don't have an equivalent per-property USB/WLS fetch --
+they derive usb.online/wireless.online from the battery status response
+instead -- so there's no off-path query to reuse for them here; they
+keep the unconditional wake on every USB/WLS notification.
 
 The device is made wakeup-capable with devm_device_init_wakeup() rather
 than a bare device_init_wakeup(dev, true): qcom_battmgr is tristate
@@ -29,17 +54,17 @@ devm action) and surfaced through dev_err_probe(), like the neighbouring
 registrations. devm_device_init_wakeup() is available since Linux 6.15
 and is present in this tree's 7.2.3 base.
 
-The USB/WLS notification class fires on plug/unplug and PD contract
-changes, which are infrequent, so this wakes on a real charger event
-without re-introducing the telemetry storm. A finer filter (waking only
-when usb.online actually toggles) is possible but needs cached online
-state; the notification-class scoping already excludes the telemetry
-that caused the storm.
+This mirrors the client-side wakeup pattern upstream uses elsewhere for
+Type-C/charger connector events (device_init_wakeup() + a bounded
+pm_wakeup event on the connector transition, not on every property
+notification), applied to the battmgr client and adapted to the fact
+that this transport can't synchronously confirm the transition on the
+RX path.
 
 Signed-off-by: unjordi <jordi@ciencias.unam.mx>
 ---
- drivers/power/supply/qcom_battmgr.c | 21 +++++++++++++++++++++
- 1 file changed, 21 insertions(+)
+ drivers/power/supply/qcom_battmgr.c | 100 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 98 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
 --- a/drivers/power/supply/qcom_battmgr.c
@@ -66,22 +91,130 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  #define NOTIF_BAT_STATUS		0x80
  #define NOTIF_BAT_INFO			0x81
  #define NOTIF_BAT_CHARGING_STATE	0x83
-@@ -1214,9 +1222,11 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+@@ -334,6 +342,16 @@ struct qcom_battmgr {
+ 	struct work_struct enable_work;
+
+ 	/*
++	 * Deferred off the glink RX path (see qcom_battmgr_notification()):
++	 * re-queries USB/WLS online state and arms a wakeup only when it
++	 * actually toggled, instead of on every USB/WLS notification.
++	 */
++	struct work_struct usb_online_work;
++	struct work_struct wls_online_work;
++	bool usb_online_wake_armed;
++	bool wls_online_wake_armed;
++
++	/*
+ 	 * @lock is used to prevent concurrent power supply requests to the
+ 	 * firmware, as it then stops responding.
+ 	 */
+@@ -1190,6 +1208,81 @@ static const struct power_supply_desc sm8350_wls_psy_desc = {
+ 	.get_property = qcom_battmgr_wls_get_property,
+ };
+
++/*
++ * qcom_battmgr_notification() runs on the glink RX path with
++ * channel->recv_lock held (see qcom_glink_rx_data() in
++ * qcom_glink_native.c), so it cannot block. Resolving usb.online/
++ * wireless.online needs a firmware round trip (qcom_battmgr_request(),
++ * which sleeps on a completion), so that has to happen off-path. These
++ * two work items do that: re-query the property from process context,
++ * and arm a wakeup only when it actually flipped -- not on every
++ * USB/WLS notification, which is what caused the wake-storm this
++ * replaces (routine PD/telemetry doorbells while charging at mid-SOC
++ * were each arming a hard wakeup event; the ADSP keeps charging
++ * regardless of whether the AP stays up for each one).
++ *
++ * SC8280XP/X1E80100 derive usb.online/wireless.online from the battery
++ * status response instead of a dedicated USB/WLS property fetch, so
++ * there is no equivalent off-path query for them here; keep waking on
++ * every notification on that variant rather than guess.
++ */
++static void qcom_battmgr_usb_online_work(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
++						     usb_online_work);
++	bool online;
++	int ret;
++
++	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
++	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
++		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
++		return;
++	}
++
++	ret = qcom_battmgr_usb_sm8350_update(battmgr, POWER_SUPPLY_PROP_ONLINE);
++	if (ret) {
++		/*
++		 * Couldn't confirm the state off-path (firmware busy or
++		 * timed out); wake conservatively rather than risk silently
++		 * missing a real attach/detach.
++		 */
++		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
++		return;
++	}
++
++	online = battmgr->usb.online;
++	if (online != battmgr->usb_online_wake_armed) {
++		battmgr->usb_online_wake_armed = online;
++		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
++	}
++}
++
++static void qcom_battmgr_wls_online_work(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
++						     wls_online_work);
++	bool online;
++	int ret;
++
++	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
++	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
++		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
++		return;
++	}
++
++	ret = qcom_battmgr_wls_sm8350_update(battmgr, POWER_SUPPLY_PROP_ONLINE);
++	if (ret) {
++		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
++		return;
++	}
++
++	online = battmgr->wireless.online;
++	if (online != battmgr->wls_online_wake_armed) {
++		battmgr->wls_online_wake_armed = online;
++		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
++	}
++}
++
+ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 				      const struct qcom_battmgr_message *msg,
+ 				      int len)
+@@ -1214,9 +1307,11 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
  		power_supply_changed(battmgr->bat_psy);
  		break;
  	case NOTIF_USB_PROPERTY:
-+		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
++		schedule_work(&battmgr->usb_online_work);
  		power_supply_changed(battmgr->usb_psy);
  		break;
  	case NOTIF_WLS_PROPERTY:
-+		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
++		schedule_work(&battmgr->wls_online_work);
  		power_supply_changed(battmgr->wls_psy);
  		break;
  	default:
-@@ -1737,6 +1747,17 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+@@ -1667,6 +1762,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	psy_cfg_supply.no_wakeup_source = true;
+
+ 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
++	INIT_WORK(&battmgr->usb_online_work, qcom_battmgr_usb_online_work);
++	INIT_WORK(&battmgr->wls_online_work, qcom_battmgr_wls_online_work);
+ 	mutex_init(&battmgr->lock);
+ 	init_completion(&battmgr->ack);
+
+@@ -1737,6 +1834,17 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
  					     "failed to register wireless charing power supply\n");
  	}
- 
+
 +	/*
 +	 * Wake the AP on a charger attach/detach (the USB/WLS notifications
 +	 * handled above); the routine battery telemetry is left to the
