@@ -9,9 +9,10 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0002-qcom-dispcc-sm8550-Fix-disp_cc_mdss_mdp_clk_src.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8550/patches/linux/0002-qcom-dispcc-sm8550-Fix-disp_cc_mdss_mdp_clk_src.patch
   upstream: unknown
-- `patches/0004-drm-msm-a6xx-Enable-IFPC-on-Adreno-740.patch`
+- `patches/0004-drm-msm-a6xx-Enable-IFPC-on-Adreno-740.patch` — **DISABLED (2026-09-18)**, commented out of `series`.
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8550/patches/linux/0004-drm-msm-a6xx-Enable-IFPC-on-Adreno-740.patch
-  upstream: unknown
+  upstream: unknown (force-enables IFPC on the A740 "same as overclocked 741"; mainline/SteamOS do NOT enable IFPC on the A740).
+  notes: Caused a hard "black screen on idle" on the RP6. After ~5 min idle the GPU inter-frame-power-collapses; the wake-to-repaint stalls on the IFPC fenced-register-write handshake (`3d6a000.gmu: delay in fenced register write`) and never presents again — permanent black, input received but no repaint, only a `gamescope-session-plus@steam.service` restart recovers it. The patch is kept on disk for provenance; re-enable only if a proper upstream IFPC fenced-write fix lands. Root-cause writeup: `rp6-black-screen-idle/RESOLUCION-2026-09-18.md`.
 - `patches/0010-msm-resource-cleanup.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/packages/linux/patches/7.0/0010-msm-resource-cleanup.patch
   upstream: unknown

@@ -3,7 +3,16 @@
 
 # ============== Display / DRM ==============
 0002-qcom-dispcc-sm8550-Fix-disp_cc_mdss_mdp_clk_src.patch
-0004-drm-msm-a6xx-Enable-IFPC-on-Adreno-740.patch
+# 0004-drm-msm-a6xx-Enable-IFPC-on-Adreno-740.patch
+#   DISABLED 2026-09-18: IFPC on the A740 wedges the GPU when idle. After ~5 min
+#   idle (Steam dims the backlight) the GPU inter-frame-power-collapses; the next
+#   wake-to-repaint stalls on the IFPC fenced-register-write handshake
+#   ("platform 3d6a000.gmu: delay in fenced register write") and never presents
+#   again -> permanent black screen, input received but nothing repaints, only a
+#   gamescope-session restart recovers it. IFPC on the A740 is NOT upstream (this
+#   patch force-enables it "same as overclocked 741"); mainline/SteamOS keep the
+#   A740 without IFPC. Dropping it returns the A740 to its upstream-correct,
+#   stable power management. See rp6-black-screen-idle/RESOLUCION-2026-09-18.md.
 0010-msm-resource-cleanup.patch
 0048-drm-msm-dsi-reparent-byte-pixel-src-to-xo-on-disable.patch
 0049-drm-msm-dpu-panel-opt-in-8bpc-dither.patch
