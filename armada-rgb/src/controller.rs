@@ -79,10 +79,20 @@ impl Controller {
         Ok(None)
     }
 
-    /// Paint the charging indicator directly (works even if `run` is not
-    /// active) and pin it, so a `run` daemon thawed during the same wake
-    /// does not repaint the normal effect over it. Meant to be called by a
-    /// suspend/wake hook right before the device goes back to sleep.
+    /// Pin the charging indicator FIRST, then paint it directly (works even
+    /// if `run` is not active). Meant to be called by a suspend/wake hook
+    /// right before the device goes back to sleep.
+    ///
+    /// The order matters and is not cosmetic: if a `run` daemon happens to
+    /// be thawing in the same brief wake window, it re-checks the pin at the
+    /// top of every loop iteration (see `run` below). Painting hardware
+    /// BEFORE the pin exists would leave a window where `run` observes "no
+    /// pin" and repaints the *old* normal config right on top of what we
+    /// just painted — a real, observed race, not hypothetical. Writing the
+    /// pin first closes it: in the tightest possible race, `run` now either
+    /// still sees no pin (and hasn't repainted anything yet — fine, we paint
+    /// next) or already sees the pin and paints the *same* indicator config
+    /// itself — never the stale one.
     pub fn charge_indicator_on(
         &self,
         color: Option<String>,
@@ -92,9 +102,9 @@ impl Controller {
             bail!("RGB unsupported: {reason}");
         }
         let indicator: ChargeIndicator = ChargeIndicator::new(color, brightness)?;
-        charging::apply_directly(&self.backend, &indicator).context("paint charge indicator")?;
         charging::save(&self.charge_path, &indicator)
             .context("persist charge indicator override")?;
+        charging::apply_directly(&self.backend, &indicator).context("paint charge indicator")?;
         Ok(indicator)
     }
 

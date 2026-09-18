@@ -404,6 +404,38 @@ fn charge_indicator_rejects_bad_input_without_touching_hardware() {
 }
 
 #[test]
+fn charge_indicator_on_fails_closed_when_the_pin_cannot_be_persisted() {
+    // Regression test for a race (found by audit, confirmed real): the pin
+    // (charge.json) must be written BEFORE hardware is painted, so `run`
+    // never observes "hardware already shows the indicator, but no pin
+    // exists" — a window where it would repaint the stale normal config
+    // right on top. We can't force that exact interleaving deterministically
+    // from a test, but we CAN prove the ordering the fix relies on: if
+    // persisting the pin fails, hardware must be left UNTOUCHED (proving
+    // `charging::save` runs, and is required to succeed, before
+    // `charging::apply_directly`). Before the fix this assertion would have
+    // failed (hardware got painted even though the pin write below fails).
+    let fixture: Fixture = Fixture::new();
+    fixture.target("rgb:l1", "blue green red", "255");
+
+    let readonly_dir: PathBuf = fixture.root.join("readonly-charge-dir");
+    fs::create_dir_all(&readonly_dir).unwrap();
+    fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let controller: Controller =
+        fixture.controller(&["rgb:l1".into()]).with_charge_path(readonly_dir.join("charge.json"));
+
+    let result = controller.charge_indicator_on(Some("00FF00".into()), Some(50));
+    assert!(result.is_err(), "expected the unwritable pin directory to fail the call");
+    assert_eq!(
+        fixture.value("rgb:l1", "brightness"),
+        "unchanged",
+        "hardware must stay untouched when the pin could not be persisted"
+    );
+    assert!(!readonly_dir.join("charge.json").exists());
+}
+
+#[test]
 fn cli_charge_indicator_on_and_off() {
     let fixture: Fixture = Fixture::new();
     fixture.target("rgb:l1", "blue green red", "255");

@@ -83,7 +83,12 @@ name if the wrong one is picked, or `ARMADA_RGB_BACKLIGHT_ROOT` if backlight
 devices live somewhere other than `/sys/class/backlight` on a given device. If
 no backlight device can be resolved, `run` logs a one-time diagnostic and
 falls back to the configured brightness unscaled (never goes dark because of a
-missing/renamed node).
+missing/renamed node). That RP6 case — one named node plus the generic
+alias — is resolved unambiguously (there is exactly one non-generic
+candidate); if a device ever exposes *more than one* non-generic candidate
+(e.g. a hypothetical dual-panel device), the pick is a genuine guess and
+`run` logs a one-time diagnostic naming every candidate and which one it
+picked, rather than staying silent about it.
 
 ### `screen_sync`
 
@@ -108,10 +113,13 @@ is resolved via `ARMADA_RGB_GAMESCOPECTL_BIN` (default: `gamescopectl` on
 `PATH`) and the captured PNG is written to `ARMADA_RGB_SCREENSHOT_PATH`
 (default: `/run/armada-rgb/screen-sync.png`, tmpfs, to avoid wearing flash
 storage with a capture every few seconds). A capture is bounded by a hard
-1.5-second timeout so a wedged compositor cannot hang the whole daemon; on any
-failure (no graphical session yet, timeout, decode error) the effect logs a
-one-time diagnostic and keeps showing the last successfully sampled colors
-(black before the first successful capture) instead of flickering.
+2.5-second timeout (comfortably under the 3s cadence above, so a slow capture
+under load just delays the next tick instead of the two ever overlapping) —
+a wedged compositor is killed and reaped, never left running or awaited
+indefinitely, so this can never hang the daemon past that timeout either way.
+On any failure (no graphical session yet, timeout, decode error) the effect
+logs a one-time diagnostic and keeps showing the last successfully sampled
+colors (black before the first successful capture) instead of flickering.
 
 ## Charging indicator (deep-sleep wake hook)
 

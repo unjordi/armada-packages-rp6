@@ -116,6 +116,12 @@ pub struct EffectState {
     backlight_root: PathBuf,
     backlight_name: Option<String>,
     backlight_warned: bool,
+    /// Separate from `backlight_warned` on purpose: ambiguity (more than one
+    /// candidate device) is a STATIC fact about the device, so it must warn
+    /// exactly once ever, not "once per failure streak" — a successful
+    /// brightness read (which resets `backlight_warned`) does not mean the
+    /// ambiguity went away.
+    backlight_ambiguity_warned: bool,
     screenshot_path: PathBuf,
     gamescopectl_bin: String,
     gamescope_runtime_dir: String,
@@ -153,6 +159,7 @@ impl Default for EffectState {
                 .unwrap_or_else(|| PathBuf::from("/sys/class/backlight")),
             backlight_name: std::env::var("ARMADA_RGB_BACKLIGHT_NAME").ok(),
             backlight_warned: false,
+            backlight_ambiguity_warned: false,
             screenshot_path: std::env::var_os("ARMADA_RGB_SCREENSHOT_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/run/armada-rgb/screen-sync.png")),
@@ -286,7 +293,15 @@ impl EffectState {
     /// than going dark. Warns once (not every tick) with the exact env vars
     /// to set if this is not a transient boot-time race.
     fn sample_backlight_pct(&mut self) -> f64 {
-        match resolve_backlight_dir(&self.backlight_root, self.backlight_name.as_deref()) {
+        let (resolved, ambiguity): (Option<PathBuf>, Option<String>) =
+            resolve_backlight_dir(&self.backlight_root, self.backlight_name.as_deref());
+        if let Some(reason) = ambiguity {
+            if !self.backlight_ambiguity_warned {
+                eprintln!("armada-rgb: sync_brightness {reason}");
+                self.backlight_ambiguity_warned = true;
+            }
+        }
+        match resolved {
             Some(dir) => {
                 let brightness: Option<u32> = read_u32(&dir.join("brightness"));
                 let maximum: Option<u32> = read_u32(&dir.join("max_brightness"));
@@ -385,31 +400,57 @@ impl EffectState {
 /// `pwm-backlight` wrapper node Linux exposes on some panels alongside the
 /// panel's own, more specific node — e.g. the RP6 exposes both
 /// `ae94000.dsi.0` and a generic `backlight`; the named one is the panel).
-fn resolve_backlight_dir(root: &Path, preferred: Option<&str>) -> Option<PathBuf> {
+///
+/// Returns `(chosen device, ambiguity warning)`. The second element is
+/// `Some` only when more than one *non-generic* candidate remains after that
+/// preference — e.g. a hypothetical dual-panel device with two named nodes —
+/// so the caller can surface that the pick was a guess instead of staying
+/// silent about it (the RP6's actual case, one named node + the generic
+/// alias, is NOT ambiguous: there is exactly one non-generic candidate).
+fn resolve_backlight_dir(root: &Path, preferred: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     if let Some(name) = preferred {
         let candidate: PathBuf = root.join(name);
-        return if candidate.join("brightness").is_file() && candidate.join("max_brightness").is_file() {
-            Some(candidate)
-        } else {
-            None
-        };
+        let found: bool =
+            candidate.join("brightness").is_file() && candidate.join("max_brightness").is_file();
+        return (if found { Some(candidate) } else { None }, None);
     }
 
-    let mut entries: Vec<PathBuf> = fs::read_dir(root)
-        .ok()?
+    let Some(read_dir) = fs::read_dir(root).ok() else {
+        return (None, None);
+    };
+    let mut entries: Vec<PathBuf> = read_dir
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.join("brightness").is_file() && path.join("max_brightness").is_file())
         .collect();
     if entries.is_empty() {
-        return None;
+        return (None, None);
     }
     entries.sort();
-    entries
-        .iter()
-        .find(|path| path.file_name().and_then(|name| name.to_str()) != Some("backlight"))
-        .or_else(|| entries.first())
-        .cloned()
+
+    let is_generic = |path: &PathBuf| path.file_name().and_then(|name| name.to_str()) == Some("backlight");
+    let named: Vec<&PathBuf> = entries.iter().filter(|path| !is_generic(path)).collect();
+
+    let chosen: Option<PathBuf> = named.first().copied().or_else(|| entries.first()).cloned();
+    let warning: Option<String> = (named.len() > 1).then(|| {
+        let names: Vec<&str> = named
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        let picked: &str = chosen
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("?");
+        format!(
+            "found {} candidate backlight devices under {} ({}); picked '{picked}' — set \
+             ARMADA_RGB_BACKLIGHT_NAME to pin the right one if this is wrong",
+            named.len(),
+            root.display(),
+            names.join(", "),
+        )
+    });
+    (chosen, warning)
 }
 
 fn read_u32(path: &Path) -> Option<u32> {
@@ -421,7 +462,9 @@ fn read_u32(path: &Path) -> Option<u32> {
 /// set — `armada-rgb run` is a system service with no graphical session env
 /// of its own, so it cannot rely on inherited environment variables. Bounded
 /// by a hard timeout so a wedged compositor cannot hang the whole daemon
-/// (config reload and every other effect share this same loop thread).
+/// (config reload and every other effect share this same loop thread): on
+/// timeout the child is killed and reaped, never left running or awaited
+/// indefinitely, so this never blocks `run` past `TIMEOUT` either way.
 fn run_screenshot_command(
     bin: &str,
     path: &Path,
@@ -429,7 +472,12 @@ fn run_screenshot_command(
     wayland_display: &str,
     su_user: Option<&str>,
 ) -> Result<(), String> {
-    const TIMEOUT: Duration = Duration::from_millis(1500);
+    // A busy compositor (e.g. a game in fullscreen) can take noticeably
+    // longer than an idle one to service a screenshot request; keep this
+    // comfortably under Effect::ScreenSync's own 3s cadence (see
+    // `Effect::frame_interval`) so a slow capture just delays the next tick
+    // instead of the two ever running back-to-back with zero gap.
+    const TIMEOUT: Duration = Duration::from_millis(2500);
     const POLL: Duration = Duration::from_millis(50);
 
     let mut command: Command = match su_user {
@@ -717,6 +765,47 @@ mod tests {
             ..EffectState::default()
         };
         assert_eq!(state.scale_for_sync(55, true), 55);
+    }
+
+    #[test]
+    fn resolve_backlight_dir_flags_ambiguity_between_multiple_named_candidates() {
+        // A hypothetical dual-panel device: two candidates survive the
+        // "prefer non-generic name" heuristic, so the pick is a genuine
+        // guess and must be surfaced, not silent.
+        let root: PathBuf = fixture_dir("resolve-ambiguous-named");
+        backlight_device(&root, "ae94000.dsi.0", 10, 100);
+        backlight_device(&root, "ae94000.dsi.1", 90, 100);
+
+        let (chosen, warning): (Option<PathBuf>, Option<String>) = resolve_backlight_dir(&root, None);
+        assert_eq!(chosen, Some(root.join("ae94000.dsi.0")), "deterministic (alphabetical) pick");
+        let warning: String = warning.expect("must flag ambiguity with >1 non-generic candidate");
+        assert!(warning.contains("ae94000.dsi.0"));
+        assert!(warning.contains("ae94000.dsi.1"));
+        assert!(warning.contains("ARMADA_RGB_BACKLIGHT_NAME"));
+    }
+
+    #[test]
+    fn resolve_backlight_dir_does_not_flag_the_rp6s_actual_case() {
+        // One named node + the generic alias is NOT ambiguous — exactly one
+        // non-generic candidate exists, so no guess is being made.
+        let root: PathBuf = fixture_dir("resolve-not-ambiguous");
+        backlight_device(&root, "backlight", 10, 100);
+        backlight_device(&root, "panel.dsi.0", 90, 100);
+
+        let (chosen, warning): (Option<PathBuf>, Option<String>) = resolve_backlight_dir(&root, None);
+        assert_eq!(chosen, Some(root.join("panel.dsi.0")));
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_backlight_dir_explicit_override_never_warns() {
+        let root: PathBuf = fixture_dir("resolve-override-no-warn");
+        backlight_device(&root, "a", 1, 100);
+        backlight_device(&root, "b", 1, 100);
+
+        let (chosen, warning): (Option<PathBuf>, Option<String>) = resolve_backlight_dir(&root, Some("a"));
+        assert_eq!(chosen, Some(root.join("a")));
+        assert!(warning.is_none());
     }
 
     // -- screen_sync ----------------------------------------------------------
