@@ -375,15 +375,29 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   from suspending) and removes the second wake-storm source. Pairs with 0904.
 - `patches/0904-power-supply-qcom-battmgr-wake-on-charger-attach-detach.patch`
   source: armada (unjordi)
-  upstream: not submitted (candidate; mirrors the ucsi_glink client-side wakeup adopted upstream)
+  upstream: not submitted (candidate; mirrors the client-side connector-event wakeup pattern
+  used elsewhere upstream)
   notes: P2 of the deep-suspend charging fix. Marks the battmgr device wakeup-capable
-  (device_init_wakeup) and arms a short hard pm_wakeup_dev_event only on the charger
-  notification class -- NOTIF_USB_PROPERTY (0x32) and NOTIF_WLS_PROPERTY (0x34) -- never
-  on NOTIF_BAT_PROPERTY (0x30) telemetry, so a charger attach/detach wakes the AP long
-  enough to service the charge handshake without re-introducing the storm. Obligate pair
-  with 0903. Open item (measurement-gated): if the ADSP proves to push NOTIF_USB
-  repeatedly during active PD charging at mid-SOC (re-storm via the USB door), narrow to
-  waking only on the usb.online transition (cache online state in the response path).
+  (devm_device_init_wakeup). Fine-filtered (2026-09-18, closes the open item below): the
+  notification-class scoping alone (NOTIF_USB_PROPERTY/NOTIF_WLS_PROPERTY, never
+  NOTIF_BAT_PROPERTY) was measured on-device to still re-storm -- the ADSP pushes
+  NOTIF_USB_PROPERTY repeatedly during an active PD charge at mid-SOC (RP6 woke
+  spontaneously for ~40s at ~84%), not just on plug/unplug. qcom_battmgr_notification()
+  runs on the glink RX path under channel->recv_lock (qcom_glink_native.c), so it cannot
+  block on the firmware round trip needed to read a fresh ONLINE value; the fix defers
+  that to a work item (qcom_battmgr_usb_online_work/wls_online_work) that re-queries
+  usb.online/wireless.online via the existing qcom_battmgr_{usb,wls}_sm8350_update() calls
+  and arms the hard pm_wakeup_dev_event only when the value actually flipped from what was
+  last armed -- routine telemetry resolves to "unchanged" and wakes nothing; a genuine
+  attach/detach flips the cache and wakes once. A failed off-path query (firmware
+  busy/timeout) falls back to waking unconditionally rather than risk missing a real
+  transition. SC8280XP/X1E80100 have no equivalent per-property fetch (they derive online
+  from the battery status response) and keep the unconditional wake on every notification.
+  Obligate pair with 0903. QA-gated: the working assumption is that the PMIC/ADSP keeps
+  charging autonomously once armed at plug-in, so the AP does not need to wake for every
+  telemetry doorbell for current to keep flowing -- the physical QA at mid-SOC
+  (current_now > 0 in deep, post-fix, no more spontaneous multi-second wakes while
+  charging) is what confirms or refutes that assumption.
 - `patches/0001-pcie-update-sm8650-dtsi.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8650/patches/linux/0001-pcie-update-sm8650-dtsi.patch
   upstream: https://lore.kernel.org/r/20260611-wake-v2-35-2744251b1181@oss.qualcomm.com
