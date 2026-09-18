@@ -95,6 +95,7 @@
 
 # ============== LED / RGB ==============
 0030-leds-Add-driver-for-HEROIC-HTR3212.patch
+0031-leds-htr3212-retain-pattern-in-suspend.patch
 
 # ============== PWM ==============
 0054_sn3112-pwm-driver.patch

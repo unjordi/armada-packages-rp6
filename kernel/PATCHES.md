@@ -251,6 +251,19 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0030-leds-Add-driver-for-HEROIC-HTR3212.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8750/patches/linux/0030-leds-Add-driver-for-HEROIC-HTR3212.patch
   upstream: unknown
+- `patches/0031-leds-htr3212-retain-pattern-in-suspend.patch`
+  source: local (armada#26)
+  upstream: not submitted
+  notes: Adds an optional `keep_alive` sysfs attribute to the HTR3212 driver
+    added by 0030. When set, htr3212_suspend() skips SHUTDOWN/SDB-low/
+    regulator_disable and htr3212_resume() skips the re-init, so the chip keeps
+    its last PWM pattern through system suspend (its vdd rail is
+    regulator-always-on). Lets the charge-indicator LED trigger keep painting
+    through deep sleep -- including when the charger is plugged in while already
+    asleep -- with no CPU. Cleared by userspace on resume (the armada
+    56-armada-rgb-suspend-charging hook), never self-cleared in resume(), so a
+    brief mid-sleep wake cannot race the chip back off. Must stay ordered after
+    0030 in series (it modifies the file 0030 creates).
 - `patches/0054_sn3112-pwm-driver.patch`
   source: https://github.com/ROCKNIX/distribution/blob/4609c5017f350e6e2307ec909e328454d5bec062/projects/ROCKNIX/devices/SM8550/patches/linux/0054_sn3112-pwm-driver.patch
   upstream: https://lore.kernel.org/r/20240424-ayn-odin2-initial-v1-2-e0aa05c991fd@gmail.com
