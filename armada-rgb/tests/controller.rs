@@ -485,6 +485,66 @@ fn run_daemon_defers_to_a_pinned_charge_indicator() {
 }
 
 #[test]
+fn sync_brightness_cli_toggle_persists_and_run_scales_on_top_of_static() {
+    let fixture: Fixture = Fixture::new();
+    fixture.target("rgb:l1", "blue green red", "255");
+
+    let backlight_root: PathBuf = fixture.root.join("backlight");
+    fs::create_dir_all(backlight_root.join("panel")).unwrap();
+    fs::write(backlight_root.join("panel/brightness"), "50\n").unwrap();
+    fs::write(backlight_root.join("panel/max_brightness"), "100\n").unwrap();
+
+    let with_backlight_env = |command: &mut Command| {
+        command
+            .env("ARMADA_RGB_BACKLIGHT_ROOT", &backlight_root)
+            .env("ARMADA_RGB_BACKLIGHT_NAME", "panel");
+    };
+
+    // A plain static color+brightness — proves sync_brightness composes with
+    // it (not a competing effect): color must stay exactly what was set.
+    let mut command: Command = fixture.command("multicolor", &["rgb:l1"], None);
+    let output: std::process::Output = command
+        .args(["set", "--color", "00FF00", "--brightness", "80"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let mut command: Command = fixture.command("multicolor", &["rgb:l1"], None);
+    let output: std::process::Output = command.args(["sync-brightness", "on"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let config: LightingConfig = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(config.sync_brightness);
+    assert_eq!(config.color, "00FF00", "sync-brightness on must not touch color");
+    assert_eq!(config.effect, armada_rgb::Effect::Static, "must not touch effect either");
+
+    let mut command: Command = fixture.command("multicolor", &["rgb:l1"], None);
+    with_backlight_env(&mut command);
+    let mut daemon: std::process::Child = command.args(["run"]).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    // Color untouched (full-scale gamma of pure green); only the separate
+    // `brightness` attribute is scaled by the 50% backlight fixture.
+    assert_eq!(fixture.value("rgb:l1", "multi_intensity"), "0 255 0");
+    assert_eq!(fixture.value("rgb:l1", "brightness"), "102"); // scale(80 * 50%, 255) = scale(40, 255)
+
+    // Turning it back off restores the unscaled brightness on the next tick.
+    let mut command: Command = fixture.command("multicolor", &["rgb:l1"], None);
+    let output: std::process::Output = command.args(["sync-brightness", "off"]).output().unwrap();
+    assert!(output.status.success());
+
+    let mut command: Command = fixture.command("multicolor", &["rgb:l1"], None);
+    with_backlight_env(&mut command);
+    let mut daemon: std::process::Child = command.args(["run"]).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert_eq!(fixture.value("rgb:l1", "brightness"), "204"); // scale(80, 255), unscaled
+}
+
+#[test]
 fn cli_reports_profile_support() {
     let fixture: Fixture = Fixture::new();
     let output: std::process::Output = fixture

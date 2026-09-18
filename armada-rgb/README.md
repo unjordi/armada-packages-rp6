@@ -36,12 +36,14 @@ armada-rgb run
 
 Available effects: `static`, `breathing` (base color pulsing), `color_cycle`
 (hue sweep, same on every LED), `rainbow` (hue sweep with a per-LED offset),
-`load` (hue follows CPU load), `battery` (hue follows charge),
-`backlight_sync` (brightness follows the screen backlight percentage), and
+`load` (hue follows CPU load), `battery` (hue follows charge), and
 `screen_sync` (per-side color sampled from the screen content — an
 ambilight). `--speed` is a percentage where `100` is the default rate (ignored
-by `backlight_sync` and `screen_sync`, which follow live system state instead
-of a fixed cycle).
+by `screen_sync`, which follows live system state instead of a fixed cycle).
+
+Brightness-follows-screen-backlight is **not** in this list — it is the
+orthogonal `sync-brightness` modifier below, which composes with *any* of
+these effects instead of replacing one.
 
 `armada-rgb run` is the lighting daemon: it keeps the saved configuration
 painted, animates the selected effect, and reloads live whenever
@@ -53,18 +55,33 @@ per-LED path; other backends fall back to a uniform color.
 The versioned catalog groups exact device-tree model names with a `channels` or
 `multicolor` backend, its target list, and an optional default correction.
 
-### `backlight_sync`
+## Brightness-follows-backlight (`sync-brightness`) — a modifier, not an effect
 
-Reads `/sys/class/backlight/*/brightness` and `max_brightness` and scales the
-*configured* brightness (the ceiling) by that percentage, so dimming the
-screen dims the LEDs proportionally instead of replacing the brightness the
-user picked. If more than one backlight device exists (some panels expose
-both a named node and a generic `pwm-backlight` wrapper — the Retroid Pocket 6
+```text
+armada-rgb sync-brightness on
+armada-rgb sync-brightness off
+```
+
+This is a **toggle on top of whatever color/effect is already configured**,
+not a replacement for one — it can be combined with `static`, `rainbow`,
+`breathing`, `screen_sync`, anything. When on, `run` reads
+`/sys/class/backlight/*/brightness` and `max_brightness` and scales
+whatever brightness the current effect just computed (the *configured*
+brightness for `static`, the mid-breath value for `breathing`, etc.) by that
+percentage, so dimming the screen dims the LEDs proportionally instead of
+replacing the brightness the user picked. Color is never touched. This
+happens in the one shared write path in `Controller::run` (not inside any
+single effect), so it applies uniformly regardless of which effect is active.
+
+Persists as `sync_brightness` in `/etc/armada/rgb.json` and takes effect on
+`run`'s next tick (at most ~1s later) without touching color, effect, or
+brightness. If more than one backlight device exists (some panels expose both
+a named node and a generic `pwm-backlight` wrapper — the Retroid Pocket 6
 exposes both `ae94000.dsi.0` and a generic `backlight`), the named one is
 preferred by default; set `ARMADA_RGB_BACKLIGHT_NAME` to pin an exact device
 name if the wrong one is picked, or `ARMADA_RGB_BACKLIGHT_ROOT` if backlight
 devices live somewhere other than `/sys/class/backlight` on a given device. If
-no backlight device can be resolved, the effect logs a one-time diagnostic and
+no backlight device can be resolved, `run` logs a one-time diagnostic and
 falls back to the configured brightness unscaled (never goes dark because of a
 missing/renamed node).
 

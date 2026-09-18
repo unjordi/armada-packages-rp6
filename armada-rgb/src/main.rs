@@ -27,7 +27,9 @@ enum Command {
         #[arg(long, value_name = "TRIGGER:RED,GREEN,BLUE")]
         correction: Option<ColorCorrection>,
         /// Animation: static, breathing, color_cycle, rainbow, load, battery,
-        /// backlight_sync, screen_sync.
+        /// screen_sync. (Brightness-follows-backlight is NOT an effect — it is
+        /// the orthogonal `sync-brightness on/off` toggle, combinable with any
+        /// of these.)
         #[arg(long, value_parser = parse_effect)]
         effect: Option<Effect>,
         /// Animation speed as a percentage (100 = default).
@@ -50,6 +52,15 @@ enum Command {
         #[command(subcommand)]
         state: ChargeIndicatorState,
     },
+    /// Toggle brightness-follows-screen-backlight as a MODIFIER on top of
+    /// whatever color/effect is already configured — not a replacement
+    /// effect. Persists (`sync_brightness` in the saved configuration) and
+    /// takes effect on `run`'s next tick (at most ~1s later) without
+    /// touching color/effect/brightness.
+    SyncBrightness {
+        #[command(subcommand)]
+        state: SyncBrightnessState,
+    },
 }
 
 #[derive(Subcommand)]
@@ -66,6 +77,14 @@ enum ChargeIndicatorState {
         brightness: Option<u8>,
     },
     /// Clear the pin and restore the saved configuration immediately.
+    Off,
+}
+
+#[derive(Subcommand)]
+enum SyncBrightnessState {
+    /// Scale the painted brightness by the live screen backlight percentage.
+    On,
+    /// Use the configured brightness as-is (the default).
     Off,
 }
 
@@ -132,6 +151,12 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&config)?);
             }
         },
+        Command::SyncBrightness { state } => {
+            let mut config: LightingConfig = controller.get()?;
+            config.sync_brightness = matches!(state, SyncBrightnessState::On);
+            let config: LightingConfig = controller.set(config)?;
+            println!("{}", serde_json::to_string_pretty(&config)?);
+        }
     }
     Ok(())
 }

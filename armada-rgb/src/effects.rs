@@ -30,8 +30,6 @@ pub enum Effect {
     Load,
     /// Hue mapped to battery charge (red empty → green full).
     Battery,
-    /// Base color, brightness scaled by the screen backlight percentage.
-    BacklightSync,
     /// Per-side color sampled from the screen content (ambilight).
     ScreenSync,
 }
@@ -54,7 +52,6 @@ impl Effect {
             Effect::Static => 0.5,
             Effect::Load => 0.3,
             Effect::Battery => 2.0,
-            Effect::BacklightSync => 0.5,
             // Sampling + decoding a screenshot is real CPU/IO work compared to
             // a sysfs read; keep this effect's own cadence slow on purpose so
             // it cannot become a background thermal/CPU drain.
@@ -75,11 +72,10 @@ impl FromStr for Effect {
             "rainbow" => Ok(Effect::Rainbow),
             "load" => Ok(Effect::Load),
             "battery" => Ok(Effect::Battery),
-            "backlight_sync" => Ok(Effect::BacklightSync),
             "screen_sync" => Ok(Effect::ScreenSync),
             other => Err(format!(
                 "unknown effect '{other}' (expected static, breathing, color_cycle, rainbow, \
-                 load, battery, backlight_sync, screen_sync)"
+                 load, battery, screen_sync)"
             )),
         }
     }
@@ -108,10 +104,10 @@ impl Frame {
     }
 }
 
-/// Mutable state carried between frames (CPU delta, smoothed load, the last
-/// successfully sampled backlight/screen colors so a transient read/capture
-/// failure degrades to "keep showing the last good value" instead of
-/// flickering to black).
+/// Mutable state carried between frames (CPU delta, smoothed load, backlight
+/// resolution for the `sync_brightness` modifier, and the last successfully
+/// sampled screen colors so a transient capture failure degrades to "keep
+/// showing the last good value" instead of flickering to black).
 pub struct EffectState {
     cpu: Option<CpuSample>,
     smooth_load: f32,
@@ -224,15 +220,6 @@ impl EffectState {
                 let hue: f64 = pct * 0.33;
                 (Frame::Uniform(hsv_to_rgb(hue, 1.0, 1.0)), brightness)
             }
-            Effect::BacklightSync => {
-                // The configured brightness is the ceiling; the screen's own
-                // percentage scales it down from there, so dimming the
-                // screen dims the LEDs proportionally instead of replacing
-                // the user's brightness choice outright.
-                let pct: f64 = self.sample_backlight_pct();
-                let scaled: u8 = (f64::from(brightness) * pct).round() as u8;
-                (Frame::Uniform(base), scaled.min(100))
-            }
             Effect::ScreenSync => {
                 let colors: Vec<[u8; 3]> = self.sample_screen_colors(count);
                 (Frame::PerTarget(colors), brightness)
@@ -279,6 +266,20 @@ impl EffectState {
         None
     }
 
+    /// Scale `brightness` (whatever the active effect already computed —
+    /// this runs in the shared write path, not inside any one effect) by the
+    /// live screen backlight percentage when `sync_brightness` is enabled.
+    /// This is a MODIFIER on top of the current color/effect, not a
+    /// replacement for either — see `LightingConfig::sync_brightness`.
+    /// A no-op (returns `brightness` unchanged) when the modifier is off.
+    pub(crate) fn scale_for_sync(&mut self, brightness: u8, sync_brightness: bool) -> u8 {
+        if !sync_brightness {
+            return brightness;
+        }
+        let pct: f64 = self.sample_backlight_pct();
+        (f64::from(brightness) * pct).round().min(100.0) as u8
+    }
+
     /// Screen backlight as a `0.0..=1.0` fraction. Falls back to `1.0`
     /// (unscaled — the configured brightness applies as-is) if no backlight
     /// device can be resolved, so a missing/renamed node dims nothing rather
@@ -317,7 +318,7 @@ impl EffectState {
 
     fn warn_backlight_once(&mut self, reason: &str) {
         if !self.backlight_warned {
-            eprintln!("armada-rgb: backlight_sync {reason}; brightness left unscaled");
+            eprintln!("armada-rgb: sync_brightness {reason}; brightness left unscaled");
             self.backlight_warned = true;
         }
     }
@@ -627,7 +628,7 @@ mod tests {
         assert_eq!(brightness, 42);
     }
 
-    // -- backlight_sync -----------------------------------------------------
+    // -- sync_brightness (modifier, not an effect) ---------------------------
 
     fn fixture_dir(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -650,8 +651,20 @@ mod tests {
     }
 
     #[test]
-    fn backlight_sync_scales_brightness_by_screen_percent() {
-        let root: PathBuf = fixture_dir("backlight-single");
+    fn scale_for_sync_is_a_noop_when_the_modifier_is_off() {
+        let root: PathBuf = fixture_dir("sync-off");
+        backlight_device(&root, "panel.dsi.0", 1, 100); // near-zero, to prove it's ignored
+        let mut state: EffectState = EffectState {
+            backlight_root: root,
+            backlight_name: None,
+            ..EffectState::default()
+        };
+        assert_eq!(state.scale_for_sync(80, false), 80);
+    }
+
+    #[test]
+    fn scale_for_sync_applies_on_top_of_any_brightness() {
+        let root: PathBuf = fixture_dir("sync-single");
         backlight_device(&root, "panel.dsi.0", 50, 100);
 
         let mut state: EffectState = EffectState {
@@ -659,17 +672,17 @@ mod tests {
             backlight_name: None,
             ..EffectState::default()
         };
-        let (frame, brightness) =
-            state.render(Effect::BacklightSync, [255, 255, 255], 80, 100, 0.0, 8);
-        assert_eq!(frame, Frame::Uniform([255, 255, 255]));
-        assert_eq!(brightness, 40); // 80% configured ceiling * 50% backlight
+        // Same math whether the 80 came from a plain static config or from an
+        // effect's own computed brightness (e.g. mid-breath) — scale_for_sync
+        // does not know or care which.
+        assert_eq!(state.scale_for_sync(80, true), 40); // 80 ceiling * 50% backlight
     }
 
     #[test]
-    fn backlight_sync_prefers_named_panel_over_generic_alias() {
+    fn scale_for_sync_prefers_named_panel_over_generic_alias() {
         // Mirrors the RP6, which exposes both a generic "backlight" wrapper
         // and the panel's own named node; the named one must win by default.
-        let root: PathBuf = fixture_dir("backlight-ambiguous");
+        let root: PathBuf = fixture_dir("sync-ambiguous");
         backlight_device(&root, "backlight", 10, 100);
         backlight_device(&root, "panel.dsi.0", 90, 100);
 
@@ -678,13 +691,12 @@ mod tests {
             backlight_name: None,
             ..EffectState::default()
         };
-        let (_frame, brightness) = state.render(Effect::BacklightSync, [1, 1, 1], 100, 100, 0.0, 8);
-        assert_eq!(brightness, 90);
+        assert_eq!(state.scale_for_sync(100, true), 90);
     }
 
     #[test]
-    fn backlight_sync_honors_explicit_name_override() {
-        let root: PathBuf = fixture_dir("backlight-override");
+    fn scale_for_sync_honors_explicit_name_override() {
+        let root: PathBuf = fixture_dir("sync-override");
         backlight_device(&root, "backlight", 10, 100);
         backlight_device(&root, "panel.dsi.0", 90, 100);
 
@@ -693,20 +705,18 @@ mod tests {
             backlight_name: Some("backlight".into()),
             ..EffectState::default()
         };
-        let (_frame, brightness) = state.render(Effect::BacklightSync, [1, 1, 1], 100, 100, 0.0, 8);
-        assert_eq!(brightness, 10);
+        assert_eq!(state.scale_for_sync(100, true), 10);
     }
 
     #[test]
-    fn backlight_sync_falls_back_to_configured_brightness_when_missing() {
-        let root: PathBuf = fixture_dir("backlight-missing"); // left empty
+    fn scale_for_sync_falls_back_to_configured_brightness_when_missing() {
+        let root: PathBuf = fixture_dir("sync-missing"); // left empty
         let mut state: EffectState = EffectState {
             backlight_root: root,
             backlight_name: None,
             ..EffectState::default()
         };
-        let (_frame, brightness) = state.render(Effect::BacklightSync, [1, 1, 1], 55, 100, 0.0, 8);
-        assert_eq!(brightness, 55);
+        assert_eq!(state.scale_for_sync(55, true), 55);
     }
 
     // -- screen_sync ----------------------------------------------------------

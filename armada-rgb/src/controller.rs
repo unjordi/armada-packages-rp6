@@ -152,9 +152,14 @@ impl Controller {
             }
 
             // Static (and disabled) reuse the exact one-shot path so a saved
-            // solid color — including any config-level correction — is honored.
+            // solid color — including any config-level correction — is
+            // honored. `sync_brightness` is applied here too: it is a
+            // modifier over the FINAL painted brightness, not part of any
+            // one effect (see `LightingConfig::sync_brightness`).
             if config.effect.is_static() {
-                if let Err(error) = self.backend.apply(&config) {
+                let mut painted: LightingConfig = config.clone();
+                painted.brightness = effects.scale_for_sync(config.brightness, config.sync_brightness);
+                if let Err(error) = self.backend.apply(&painted) {
                     eprintln!("armada-rgb: apply failed: {error:#}");
                 }
                 sleep(Duration::from_secs_f64(config.effect.frame_interval(FPS)));
@@ -178,6 +183,10 @@ impl Controller {
                 t,
                 count,
             );
+            // `sync_brightness` scales whatever brightness the effect just
+            // computed (a plain color, a breath, rainbow, ...) — it composes
+            // with any effect rather than being one itself.
+            let brightness: u8 = effects.scale_for_sync(brightness, config.sync_brightness);
             if let Err(error) = self.backend.render(&frame.expand(count), brightness) {
                 eprintln!("armada-rgb: render failed: {error:#}");
             }

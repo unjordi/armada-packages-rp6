@@ -23,6 +23,19 @@ pub struct LightingConfig {
     /// Animation speed as a percentage (100 = default). Ignored by `static`.
     #[serde(default = "default_speed", skip_serializing_if = "is_default_speed")]
     pub speed: u16,
+    /// Modifier, ORTHOGONAL to `effect`/`color`: when true, the brightness
+    /// that actually gets painted is scaled by the live screen backlight
+    /// percentage, on top of whatever effect/color is active (breathing,
+    /// rainbow, a plain static color, ...). This is a toggle on top of the
+    /// user's existing choice, not a replacement effect — see
+    /// `Controller::run`, which applies the scaling in the one shared write
+    /// path rather than any single effect.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sync_brightness: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_speed() -> u16 {
@@ -43,6 +56,7 @@ impl Default for LightingConfig {
             correction: None,
             effect: Effect::Static,
             speed: DEFAULT_SPEED,
+            sync_brightness: false,
         }
     }
 }
@@ -88,6 +102,7 @@ mod tests {
         )
         .unwrap();
         assert!(old_config.correction.is_none());
+        assert!(!old_config.sync_brightness, "must default to off for old saves");
 
         let config: LightingConfig = LightingConfig {
             color: "a1b2c3".into(),
@@ -116,5 +131,27 @@ mod tests {
             ..LightingConfig::default()
         };
         assert!(version.validate().is_err());
+    }
+
+    #[test]
+    fn sync_brightness_is_a_modifier_independent_of_effect_and_omitted_when_off() {
+        let synced: LightingConfig = LightingConfig {
+            effect: Effect::Rainbow,
+            sync_brightness: true,
+            ..LightingConfig::default()
+        }
+        .validate()
+        .unwrap();
+        assert!(synced.sync_brightness);
+        assert_eq!(synced.effect, Effect::Rainbow, "orthogonal: does not replace the effect");
+        assert!(serde_json::to_string(&synced).unwrap().contains("\"sync_brightness\":true"));
+
+        // Off is the default and stays omitted, same as `effect: static`.
+        let plain: LightingConfig = LightingConfig::default().validate().unwrap();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("sync_brightness"));
+
+        let round_tripped: LightingConfig =
+            serde_json::from_str(&serde_json::to_string(&synced).unwrap()).unwrap();
+        assert_eq!(round_tripped, synced);
     }
 }
