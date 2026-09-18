@@ -1,8 +1,11 @@
+use crate::effects::Effect;
 use crate::ColorCorrection;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 const CONFIG_VERSION: u32 = 1;
+const DEFAULT_SPEED: u16 = 100;
+const MAX_SPEED: u16 = 1000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +16,21 @@ pub struct LightingConfig {
     pub color: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correction: Option<ColorCorrection>,
+    /// Animation applied on top of the base color. `static` (the default)
+    /// keeps the original solid-color behaviour and is omitted when saved.
+    #[serde(default, skip_serializing_if = "Effect::is_static")]
+    pub effect: Effect,
+    /// Animation speed as a percentage (100 = default). Ignored by `static`.
+    #[serde(default = "default_speed", skip_serializing_if = "is_default_speed")]
+    pub speed: u16,
+}
+
+fn default_speed() -> u16 {
+    DEFAULT_SPEED
+}
+
+fn is_default_speed(speed: &u16) -> bool {
+    *speed == DEFAULT_SPEED
 }
 
 impl Default for LightingConfig {
@@ -23,6 +41,8 @@ impl Default for LightingConfig {
             brightness: 25,
             color: "FFFFFF".into(),
             correction: None,
+            effect: Effect::Static,
+            speed: DEFAULT_SPEED,
         }
     }
 }
@@ -40,6 +60,9 @@ impl LightingConfig {
         }
         if let Some(correction) = &self.correction {
             correction.validate()?;
+        }
+        if self.speed == 0 || self.speed > MAX_SPEED {
+            bail!("speed must be between 1 and {MAX_SPEED}");
         }
 
         self.color.make_ascii_uppercase();

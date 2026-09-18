@@ -36,6 +36,39 @@ impl LightingBackend {
             Self::Unsupported(_) => None,
         }
     }
+
+    /// Number of LED targets the active backend drives (0 if unsupported).
+    pub fn target_count(&self) -> usize {
+        match self {
+            Self::Channels(backend) => backend.targets.len(),
+            Self::Multicolor(backend) => backend.targets.len(),
+            Self::Unsupported(_) => 0,
+        }
+    }
+
+    /// Paint an explicit color per target at a shared brightness percentage.
+    /// Used by the animation loop: multicolor devices honour per-target colors
+    /// (for spatial effects like rainbow); other backends fall back to a
+    /// uniform color (the first entry) through their validated `apply` path.
+    pub fn render(&self, colors: &[[u8; 3]], brightness: u8) -> Result<()> {
+        match self {
+            Self::Multicolor(backend) => backend.render(colors, brightness),
+            Self::Channels(backend) => {
+                let color: [u8; 3] = colors.first().copied().unwrap_or([0, 0, 0]);
+                backend.apply(&uniform_config(color, brightness))
+            }
+            Self::Unsupported(reason) => bail!("{reason}"),
+        }
+    }
+}
+
+fn uniform_config(rgb: [u8; 3], brightness: u8) -> LightingConfig {
+    LightingConfig {
+        enabled: true,
+        brightness,
+        color: format!("{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]),
+        ..LightingConfig::default()
+    }
 }
 
 pub struct ChannelBackend {
@@ -202,6 +235,40 @@ impl MulticolorBackend {
             });
         }
         Ok(targets)
+    }
+
+    /// Paint one already-computed color per target at `brightness` percent,
+    /// reusing the profile correction, `multi_index` order, gamma curve and
+    /// brightness scaling of the `apply` path. Missing colors default to off.
+    fn render(&self, colors: &[[u8; 3]], brightness: u8) -> Result<()> {
+        validate_names(&self.targets)?;
+        for (index, name) in self.targets.iter().enumerate() {
+            let rgb: [u8; 3] = colors.get(index).copied().unwrap_or([0, 0, 0]);
+            let rgb: [u8; 3] = match &self.correction {
+                Some(correction) => correction.apply(rgb),
+                None => rgb,
+            };
+            let path: PathBuf = self.root.join(name);
+            let order: Vec<String> = read_order(&path.join("multi_index"))?;
+            let maximum: u32 = read_maximum(&path.join("max_brightness"))?;
+            let values: Vec<String> = order
+                .iter()
+                .map(|channel| channel_value(channel, rgb, maximum).to_string())
+                .collect();
+            let mut intensity: File = OpenOptions::new()
+                .write(true)
+                .open(path.join("multi_intensity"))
+                .with_context(|| format!("open {name} multi_intensity"))?;
+            write_attr(&mut intensity, &values.join(" "))
+                .with_context(|| format!("write {name} color"))?;
+            let mut brightness_file: File = OpenOptions::new()
+                .write(true)
+                .open(path.join("brightness"))
+                .with_context(|| format!("open {name} brightness"))?;
+            write_attr(&mut brightness_file, &scale(brightness, maximum).to_string())
+                .with_context(|| format!("write {name} brightness"))?;
+        }
+        Ok(())
     }
 }
 
