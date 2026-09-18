@@ -1,0 +1,136 @@
+From 340c621be11b73a437f6ff8785edcf407017d883 Mon Sep 17 00:00:00 2001
+From: unjordi <jordi.serra@pind.mx>
+Date: Fri, 18 Sep 2026 12:00:00 -0600
+Subject: [PATCH] leds: htr3212: retain LED pattern through system suspend
+
+Add an optional keep_alive sysfs attribute on the HTR3212 controller. When
+set, the driver skips the software/hardware shutdown and regulator_disable in
+its system suspend hook (and the matching re-init on resume), so the chip keeps
+driving its last PWM pattern with no CPU. Its vdd rail is a regulator-always-on
+fixed regulator, so nothing gets physically cut.
+
+This lets a charge-indicator LED trigger keep painting the stick LEDs through
+deep sleep -- including being lit by the kernel when the charger is plugged in
+while the device is already asleep -- without waking userspace (armada#26).
+---
+ drivers/leds/leds-htr3212.c | 64 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/drivers/leds/leds-htr3212.c b/drivers/leds/leds-htr3212.c
+index 1673fe2..9ef5e19 100644
+--- a/drivers/leds/leds-htr3212.c
++++ b/drivers/leds/leds-htr3212.c
+@@ -11,11 +11,13 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/kernel.h>
++#include <linux/kstrtox.h>
+ #include <linux/leds.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/regmap.h>
++#include <linux/sysfs.h>
+ 
+ #define HTR3212_CHANNELS 12
+ #define HTR3212_ENABLE_BIT 1
+@@ -43,6 +45,7 @@ struct htr3212_priv {
+ 	struct mutex lock;
+ 	struct htr3212_led_data leds[HTR3212_CHANNELS];
+ 	unsigned int num_leds;
++	bool keep_alive;
+ };
+ 
+ static int htr3212_write(struct htr3212_priv *priv, u8 reg, u8 val)
+@@ -217,6 +220,48 @@ static const struct regmap_config htr3212_regmap_config = {
+ 	.cache_type = REGCACHE_NONE,
+ };
+ 
++/*
++ * keep_alive: when set, the controller is NOT powered down on system suspend,
++ * so it keeps driving whatever PWM pattern was last written (its vdd rail is
++ * a regulator-always-on fixed regulator, so nothing gets cut). Userspace (the
++ * armada system-sleep hook, armada#26) sets this in the suspend `pre` step so
++ * a charge-indicator LED trigger keeps painting through deep sleep -- including
++ * being lit by the kernel when the charger is plugged in while already asleep,
++ * with no CPU/userspace running. The hook clears it again in the resume `post`
++ * step so ordinary suspends power the chip down as before.
++ */
++static ssize_t keep_alive_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct htr3212_priv *priv = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", priv->keep_alive);
++}
++
++static ssize_t keep_alive_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct htr3212_priv *priv = dev_get_drvdata(dev);
++	bool val;
++	int ret;
++
++	ret = kstrtobool(buf, &val);
++	if (ret)
++		return ret;
++
++	priv->keep_alive = val;
++
++	return count;
++}
++static DEVICE_ATTR_RW(keep_alive);
++
++static struct attribute *htr3212_attrs[] = {
++	&dev_attr_keep_alive.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(htr3212);
++
+ static int htr3212_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+@@ -278,6 +323,14 @@ static int htr3212_suspend(struct device *dev)
+ 	struct htr3212_priv *priv = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	/*
++	 * Leave the controller running so it retains its PWM pattern across
++	 * the sleep (armada#26). The vdd rail is regulator-always-on, so the
++	 * only power kept up is the controller's own standby draw.
++	 */
++	if (priv->keep_alive)
++		return 0;
++
+ 	ret = htr3212_write(priv, HTR3212_SHUTDOWN, 0x00);
+ 	if (ret)
+ 		dev_err(dev, "Failed to shut down device on suspend (%pe)\n",
+@@ -294,6 +347,16 @@ static int htr3212_resume(struct device *dev)
+ 	struct htr3212_priv *priv = dev_get_drvdata(dev);
+ 	int ret;
+ 
++	/*
++	 * If we kept the controller alive across suspend it was never powered
++	 * down, so there is nothing to re-init (re-initialising would reset the
++	 * registers and clear the pattern). keep_alive is cleared by userspace
++	 * (the resume `post` hook), not here, so a brief mid-sleep wake to paint
++	 * the charge indicator cannot race it back off before real resume.
++	 */
++	if (priv->keep_alive)
++		return 0;
++
+ 	ret = regulator_enable(priv->vdd);
+ 	if (ret < 0) {
+ 		dev_err(dev, "Failed to enable regulator on resume (%pe)\n",
+@@ -348,6 +411,7 @@ static struct i2c_driver htr3212_driver = {
+ 	.driver = {
+ 		.name	= "htr3212",
+ 		.of_match_table = of_htr3212_match,
++		.dev_groups = htr3212_groups,
+ 		.pm	= pm_sleep_ptr(&htr3212_pm_ops),
+ 	},
+ 	.probe		= htr3212_probe,
+-- 
+2.55.0
+
