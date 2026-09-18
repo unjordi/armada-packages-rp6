@@ -1,0 +1,77 @@
+From: unjordi <jordi@ciencias.unam.mx>
+Subject: [PATCH] hwmon: pwm-fan: optional static PWM kept across suspend
+
+pwm_fan_suspend() unconditionally powers the fan off on suspend-to-RAM:
+it zeroes the PWM duty and, via pwm_fan_power_off(force=true), disables
+the fan-supply regulator. On a battery-powered handheld that also charges
+while deep-suspended (PSCI system suspend, all CPUs powered down), this
+leaves the battery cooking with zero airflow during a charge, because no
+CPU is up to run any thermal loop and the charger/thermal telemetry lives
+in the ADSP firmware, not Linux.
+
+Add an optional module parameter, suspend_pwm. When it is non-zero,
+pwm_fan_suspend() keeps the fan running at that static duty (via set_pwm,
+which re-enables the fan-supply regulator and applies the duty) instead of
+powering it off. The PMIC LPG that drives the PWM keeps emitting the duty
+autonomously while the AP is down, so the fan keeps spinning through S2R.
+suspend_pwm defaults to 0, which preserves the stock power-off-on-suspend
+behaviour for every board.
+
+The knob is deliberately a global module parameter set from userspace via
+/sys/module/pwm_fan/parameters/suspend_pwm right before suspend, so the
+policy (e.g. "spin only while charging, never on battery, to avoid
+draining the pack") stays out of the generic driver. Two conditions must
+also hold for the fan to actually keep spinning: the fan-supply regulator
+must remain powered in suspend (drop regulator-off-in-suspend on that rail
+in DT) and the PWM source must retain its register state across S2R (true
+for the PMIC LPG). Neither is provided here; this patch only stops the
+driver from tearing the fan down.
+
+This is a static floor, not a temperature-responsive curve: with the AP
+down nothing can re-read the battery temperature or re-target the duty.
+It is airflow-while-charging, not closed-loop cooling.
+
+Signed-off-by: unjordi <jordi@ciencias.unam.mx>
+---
+diff --git a/drivers/hwmon/pwm-fan.c b/drivers/hwmon/pwm-fan.c
+--- a/drivers/hwmon/pwm-fan.c
++++ b/drivers/hwmon/pwm-fan.c
+@@ -22,6 +22,21 @@
+ 
+ #define MAX_PWM 255
+ 
++/*
++ * Optional static PWM (1..MAX_PWM) to keep the fan spinning across
++ * suspend-to-RAM instead of powering it off. 0 (default) keeps the stock
++ * power-off-on-suspend behaviour. Userspace sets it via
++ * /sys/module/pwm_fan/parameters/suspend_pwm right before suspend (e.g. only
++ * while charging), so a battery-heating deep-sleep charge still gets airflow
++ * where no CPU is up to run the thermal loop. The fan-supply regulator must
++ * stay powered in suspend for this to take effect (DT: drop
++ * regulator-off-in-suspend on that rail).
++ */
++static unsigned int suspend_pwm;
++module_param(suspend_pwm, uint, 0644);
++MODULE_PARM_DESC(suspend_pwm,
++	"static PWM (1..255) kept across suspend; 0 = power off on suspend (default)");
++
+ struct pwm_fan_tach {
+ 	int irq;
+ 	atomic_t pulses;
+@@ -711,6 +726,16 @@
+ {
+ 	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+ 
++	/*
++	 * Keep the fan at a static floor across suspend when userspace asked for
++	 * it (suspend_pwm > 0). set_pwm() re-enables the fan-supply regulator and
++	 * applies the duty; the PMIC PWM keeps emitting it while the AP is down.
++	 * 0 falls back to the stock power-off.
++	 */
++	if (suspend_pwm)
++		return set_pwm(ctx,
++			       suspend_pwm > MAX_PWM ? MAX_PWM : suspend_pwm);
++
+ 	return pwm_fan_power_off(ctx, true);
+ }
+ 

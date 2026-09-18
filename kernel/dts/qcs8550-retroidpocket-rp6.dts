@@ -372,6 +372,20 @@
         };
 };
 
+/*
+ * Fan rail across suspend: drop regulator-off-in-suspend so vdd_fan_5v0 is not
+ * force-cut by the regulator core in suspend-to-RAM. This lets the fan keep
+ * spinning during a deep-suspend charge (cooling the battery while no CPU is up
+ * to run the thermal loop), paired with the pwm-fan suspend_pwm knob (kernel
+ * patch 0502) and the armada-fan-suspend-charging hook that only raises it
+ * while charging. Leak-safe on battery: the pwm-fan driver still disables the
+ * fan-supply consumer on suspend when suspend_pwm is 0, so the fixed GPIO
+ * regulator drops (use_count 0) and the rail powers off.
+ */
+&vdd_fan_5v0 {
+	/delete-node/ regulator-state-mem;
+};
+
 &pmk8550_pwm {
 	status = "okay";
 };

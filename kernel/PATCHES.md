@@ -321,6 +321,28 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0500-ROCKNIX-set-boot-fanspeed.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8550/patches/linux/0500-ROCKNIX-set-boot-fanspeed.patch
   upstream: unknown
+- `patches/0502-hwmon-pwm-fan-optional-static-pwm-across-suspend.patch`
+  source: local (Armada)
+  upstream: not submitted
+  notes: pwm_fan_suspend() unconditionally powers the fan off on suspend-to-RAM
+  (zeroes the PWM duty and disables the fan-supply regulator via
+  pwm_fan_power_off(force=true)). This adds an optional `suspend_pwm` module
+  parameter: when non-zero, pwm_fan_suspend() keeps the fan at that static duty
+  (via set_pwm, which re-enables the regulator and applies the duty) instead of
+  powering off; 0 (default) preserves stock behaviour on every board. Purpose:
+  give the RP6 battery airflow while it charges in deep suspend (PSCI system
+  suspend, all CPUs down), where no CPU is up to run the thermal loop. The knob
+  is set from userspace right before suspend so the "only while charging, never
+  on battery" policy stays out of the generic driver
+  (armada-fan-suspend-charging in the armada OS repo). Two companions are
+  required for the fan to actually keep spinning: the fan-supply rail must not be
+  cut in suspend (DT: drop `regulator-off-in-suspend` on `vdd_fan_5v0`, done in
+  qcs8550-retroidpocket-rp6.dts) and the PWM source must retain its register
+  state across S2R (true for the PMIC LPG / leds-qcom-lpg, which has no suspend
+  callbacks). This is a STATIC floor, not a temperature-responsive curve: with
+  the AP down nothing can re-read battery temperature or re-target the duty. QA-
+  gated (needs a physical deep-charge test: fan spins in deep while charging AND
+  no extra battery drain on battery-suspend).
 - `patches/0501-ROCKNIX-fix-wifi-and-bt-mac.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8550/patches/linux/0501-ROCKNIX-fix-wifi-and-bt-mac.patch
   upstream: unknown
