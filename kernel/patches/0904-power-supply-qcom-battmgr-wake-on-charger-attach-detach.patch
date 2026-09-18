@@ -38,6 +38,28 @@ wakes the AP once. If the off-path query itself fails (firmware busy or
 timed out), fall back to waking unconditionally rather than risk
 silently swallowing a real transition.
 
+Deferring the decision opens a missed-wakeup race: between the handler
+scheduling the work and the work running, autosleep/s2idle/deep can
+complete suspend and freeze the workqueue, so the work never decides and
+the attach is lost. Arming the wakeup inside the work is too late -- if
+the system already suspended there is nobody left to wake. Instead the
+handler takes a wakeup-source hold (pm_stay_awake()) before scheduling
+and the work drops it (pm_relax()) on every exit path; the hold keeps
+suspend from completing until the decision is made. pm_stay_awake() and
+pm_wakeup_dev_event() both take the wakeup source's lock with
+spin_lock_irqsave(), so they are safe to call from the RX callback under
+channel->recv_lock. The hold is balanced against schedule_work()
+coalescing (one hold per pending run, one pm_relax() per run) so an idle
+system with the cable in still suspends. This is the same client-side
+wakeup idiom upstream took for ucsi_glink (device_init_wakeup() +
+pm_wakeup_dev_event(hard=true) on the connector event), extended with
+the pm_stay_awake()/pm_relax() hold because -- unlike ucsi_glink, whose
+event is already an edge-like connector notification -- battmgr cannot
+confirm the transition synchronously on the RX path and so must defer.
+The works run on the unfreezable system_wq: a freezable queue would
+freeze exactly when the work must run to decide whether to abort the
+suspend.
+
 SC8280XP/X1E80100 don't have an equivalent per-property USB/WLS fetch --
 they derive usb.online/wireless.online from the battery status response
 instead -- so there's no off-path query to reuse for them here; they
@@ -54,17 +76,19 @@ devm action) and surfaced through dev_err_probe(), like the neighbouring
 registrations. devm_device_init_wakeup() is available since Linux 6.15
 and is present in this tree's 7.2.3 base.
 
-This mirrors the client-side wakeup pattern upstream uses elsewhere for
-Type-C/charger connector events (device_init_wakeup() + a bounded
-pm_wakeup event on the connector transition, not on every property
-notification), applied to the battmgr client and adapted to the fact
-that this transport can't synchronously confirm the transition on the
-RX path.
+Because battmgr is tristate and the works sleep on the firmware, a
+notification landing just before unbind could leave a work dereferencing
+the devm-freed battmgr. Register a devm action that cancel_work_sync()s
+both works; it is registered before devm_pmic_glink_client_alloc() so
+devm's LIFO teardown deregisters the glink client first (stopping new
+notifications), then cancels the works, then tears down the wakeup
+source -- so a final pm_relax() from a cancelled-but-pending work still
+has a live source.
 
 Signed-off-by: unjordi <jordi@ciencias.unam.mx>
 ---
- drivers/power/supply/qcom_battmgr.c | 100 +++++++++++++++++++++++++++++++++-
- 1 file changed, 98 insertions(+), 2 deletions(-)
+ drivers/power/supply/qcom_battmgr.c | 171 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 171 insertions(+)
 
 diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
 --- a/drivers/power/supply/qcom_battmgr.c
@@ -91,10 +115,11 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
  #define NOTIF_BAT_STATUS		0x80
  #define NOTIF_BAT_INFO			0x81
  #define NOTIF_BAT_CHARGING_STATE	0x83
-@@ -334,6 +342,16 @@ struct qcom_battmgr {
+@@ -333,6 +341,16 @@ struct qcom_battmgr {
+ 
  	struct work_struct enable_work;
-
- 	/*
+ 
++	/*
 +	 * Deferred off the glink RX path (see qcom_battmgr_notification()):
 +	 * re-queries USB/WLS online state and arms a wakeup only when it
 +	 * actually toggled, instead of on every USB/WLS notification.
@@ -104,14 +129,13 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +	bool usb_online_wake_armed;
 +	bool wls_online_wake_armed;
 +
-+	/*
+ 	/*
  	 * @lock is used to prevent concurrent power supply requests to the
  	 * firmware, as it then stops responding.
- 	 */
-@@ -1190,6 +1208,81 @@ static const struct power_supply_desc sm8350_wls_psy_desc = {
+@@ -1190,6 +1208,113 @@ static const struct power_supply_desc sm8350_wls_psy_desc = {
  	.get_property = qcom_battmgr_wls_get_property,
  };
-
+ 
 +/*
 + * qcom_battmgr_notification() runs on the glink RX path with
 + * channel->recv_lock held (see qcom_glink_rx_data() in
@@ -140,7 +164,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 +	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
 +		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
-+		return;
++		goto relax;
 +	}
 +
 +	ret = qcom_battmgr_usb_sm8350_update(battmgr, POWER_SUPPLY_PROP_ONLINE);
@@ -151,7 +175,7 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +		 * missing a real attach/detach.
 +		 */
 +		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
-+		return;
++		goto relax;
 +	}
 +
 +	online = battmgr->usb.online;
@@ -159,6 +183,13 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +		battmgr->usb_online_wake_armed = online;
 +		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
 +	}
++relax:
++	/*
++	 * Release the deferral hold taken by the notification handler for
++	 * this run. Every exit path must reach this (hence goto, not return):
++	 * a missed pm_relax() leaks the hold and the AP never suspends again.
++	 */
++	pm_relax(battmgr->dev);
 +}
 +
 +static void qcom_battmgr_wls_online_work(struct work_struct *work)
@@ -171,13 +202,13 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 +	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
 +		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
-+		return;
++		goto relax;
 +	}
 +
 +	ret = qcom_battmgr_wls_sm8350_update(battmgr, POWER_SUPPLY_PROP_ONLINE);
 +	if (ret) {
 +		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
-+		return;
++		goto relax;
 +	}
 +
 +	online = battmgr->wireless.online;
@@ -185,36 +216,80 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +		battmgr->wls_online_wake_armed = online;
 +		pm_wakeup_dev_event(battmgr->dev, QCOM_BATTMGR_WAKEUP_MS, true);
 +	}
++relax:
++	/* See qcom_battmgr_usb_online_work(): release the deferral hold. */
++	pm_relax(battmgr->dev);
++}
++
++static void qcom_battmgr_cancel_online_works(void *data)
++{
++	struct qcom_battmgr *battmgr = data;
++
++	/*
++	 * Registered before devm_pmic_glink_client_alloc(), so devm's LIFO
++	 * teardown deregisters the glink client first: by the time this runs
++	 * no further notification can queue these works. Drain whatever the
++	 * last one left in flight before battmgr is freed (it is tristate;
++	 * a work still touching battmgr after unbind would be a UAF). A work
++	 * still pending (cancelled before it ran) never reached its pm_relax,
++	 * leaving the notification handler's pm_stay_awake() unbalanced;
++	 * cancel_work_sync() reports that case, so relax it to keep the count
++	 * even while the wakeup source is still alive (its own devm teardown
++	 * runs after this one).
++	 */
++	if (cancel_work_sync(&battmgr->usb_online_work))
++		pm_relax(battmgr->dev);
++	if (cancel_work_sync(&battmgr->wls_online_work))
++		pm_relax(battmgr->dev);
 +}
 +
  static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
  				      const struct qcom_battmgr_message *msg,
  				      int len)
-@@ -1214,9 +1307,11 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+@@ -1214,9 +1339,30 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
  		power_supply_changed(battmgr->bat_psy);
  		break;
  	case NOTIF_USB_PROPERTY:
-+		schedule_work(&battmgr->usb_online_work);
++		/*
++		 * Keep the AP awake across the deferred decision: autosleep/
++		 * s2idle/deep must not complete suspend (which freezes the
++		 * workqueue) before usb_online_work runs and decides whether
++		 * this was a real attach. pm_stay_awake() is spinlock-safe
++		 * (spin_lock_irqsave), so it is fine on this RX path (this
++		 * callback runs under the glink channel->recv_lock).
++		 *
++		 * Balance against schedule_work() coalescing: hold once per
++		 * *pending* work run. If the work was already queued this
++		 * notification did not add a run, so its pending run will
++		 * pm_relax() the earlier hold -- drop this one to stay
++		 * balanced (invariant: outstanding holds == pending work runs,
++		 * each run relaxes exactly one).
++		 */
++		pm_stay_awake(battmgr->dev);
++		if (!schedule_work(&battmgr->usb_online_work))
++			pm_relax(battmgr->dev);
  		power_supply_changed(battmgr->usb_psy);
  		break;
  	case NOTIF_WLS_PROPERTY:
-+		schedule_work(&battmgr->wls_online_work);
++		pm_stay_awake(battmgr->dev);
++		if (!schedule_work(&battmgr->wls_online_work))
++			pm_relax(battmgr->dev);
  		power_supply_changed(battmgr->wls_psy);
  		break;
  	default:
-@@ -1667,6 +1762,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+@@ -1667,6 +1813,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
  	psy_cfg_supply.no_wakeup_source = true;
-
+ 
  	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
 +	INIT_WORK(&battmgr->usb_online_work, qcom_battmgr_usb_online_work);
 +	INIT_WORK(&battmgr->wls_online_work, qcom_battmgr_wls_online_work);
  	mutex_init(&battmgr->lock);
  	init_completion(&battmgr->ack);
-
-@@ -1737,6 +1834,17 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 
+@@ -1737,6 +1885,29 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
  					     "failed to register wireless charing power supply\n");
  	}
-
+ 
 +	/*
 +	 * Wake the AP on a charger attach/detach (the USB/WLS notifications
 +	 * handled above); the routine battery telemetry is left to the
@@ -225,6 +300,18 @@ diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_bat
 +	ret = devm_device_init_wakeup(dev);
 +	if (ret)
 +		return dev_err_probe(dev, ret, "failed to enable wakeup\n");
++
++	/*
++	 * Cancel the online works on unbind. Registered before the glink
++	 * client below so devm's LIFO teardown deregisters the client (and
++	 * thus stops new notifications) before this cancels the works,
++	 * and before the wakeup source is torn down, so any final pm_relax
++	 * still has a live source.
++	 */
++	ret = devm_add_action_or_reset(dev, qcom_battmgr_cancel_online_works,
++				       battmgr);
++	if (ret)
++		return ret;
 +
  	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
  						       qcom_battmgr_callback,
