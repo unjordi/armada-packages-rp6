@@ -342,7 +342,7 @@ fn write_attr(file: &mut File, value: &str) -> std::io::Result<()> {
 
 /// Reclaim an LED from a kernel trigger before the daemon drives it.
 ///
-/// The suspend charge-indicator hand-off (armada#26) arms a kernel
+/// The suspend charging hand-off (armada#26) arms a kernel
 /// `<psy>-charging-orange-full-green` trigger on these nodes while the device
 /// sleeps -- so the charge state keeps painting through deep sleep with no CPU
 /// -- and the resume hook disarms it (writes `none`) before the daemon runs.

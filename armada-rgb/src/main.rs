@@ -1,7 +1,7 @@
 //! Command line interface for RGB lighting.
 
 use anyhow::Result;
-use armada_rgb::{ChargeIndicator, ColorCorrection, Controller, Effect, LightingConfig};
+use armada_rgb::{ColorCorrection, Controller, Effect, LightingConfig};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -43,15 +43,6 @@ enum Command {
     /// Run the lighting daemon: keep the saved configuration painted, animate
     /// the selected effect, and reload live when the config changes.
     Run,
-    /// Paint (or clear) the fixed indicator used while the device is asleep.
-    /// The hardware holds a plain color without CPU help, so this is what a
-    /// suspend/wake hook calls right before (and after) the brief
-    /// wake-on-charge-attach window during deep sleep — see the `armada-rgb`
-    /// README for the full contract.
-    ChargeIndicator {
-        #[command(subcommand)]
-        state: ChargeIndicatorState,
-    },
     /// Toggle brightness-follows-screen-backlight as a MODIFIER on top of
     /// whatever color/effect is already configured — not a replacement
     /// effect. Persists (`sync_brightness` in the saved configuration) and
@@ -61,23 +52,6 @@ enum Command {
         #[command(subcommand)]
         state: SyncBrightnessState,
     },
-}
-
-#[derive(Subcommand)]
-enum ChargeIndicatorState {
-    /// Paint the indicator now (works even if `run` is not active) and pin
-    /// it so `run`, if thawed during the same window, does not repaint the
-    /// normal effect over it.
-    On {
-        /// Defaults to a dim amber if omitted.
-        #[arg(long)]
-        color: Option<String>,
-        /// Percentage 0-100. Defaults to a low, non-distracting level.
-        #[arg(long)]
-        brightness: Option<u8>,
-    },
-    /// Clear the pin and restore the saved configuration immediately.
-    Off,
 }
 
 #[derive(Subcommand)]
@@ -141,16 +115,6 @@ fn main() -> Result<()> {
         Command::Run => {
             controller.run()?;
         }
-        Command::ChargeIndicator { state } => match state {
-            ChargeIndicatorState::On { color, brightness } => {
-                let indicator: ChargeIndicator = controller.charge_indicator_on(color, brightness)?;
-                println!("{}", serde_json::to_string_pretty(&indicator)?);
-            }
-            ChargeIndicatorState::Off => {
-                let config: LightingConfig = controller.charge_indicator_off()?;
-                println!("{}", serde_json::to_string_pretty(&config)?);
-            }
-        },
         Command::SyncBrightness { state } => {
             let mut config: LightingConfig = controller.get()?;
             config.sync_brightness = matches!(state, SyncBrightnessState::On);
