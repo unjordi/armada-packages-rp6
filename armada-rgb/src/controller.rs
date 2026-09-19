@@ -1,6 +1,5 @@
-use crate::charging::{self, ChargeIndicator};
 use crate::{config, runtime, EffectState, LightingBackend, LightingConfig};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
@@ -11,34 +10,19 @@ const FPS: u32 = 30;
 pub struct Controller {
     config_path: PathBuf,
     backend: LightingBackend,
-    charge_path: PathBuf,
 }
 
 impl Controller {
     pub fn new(config_path: PathBuf, backend: LightingBackend) -> Self {
-        // Deterministic per-caller default (a sibling of the config file) so
-        // tests that build a `Controller` directly stay isolated without
-        // needing to know about `/run`. `from_env()` overrides this with the
-        // real (tmpfs) production path below.
-        let charge_path: PathBuf = config_path.with_file_name("charge.json");
         Self {
             config_path,
             backend,
-            charge_path,
         }
-    }
-
-    /// Override where the charging-indicator pin is read/written. Used by
-    /// `from_env()` to point at the real (tmpfs) production path.
-    pub fn with_charge_path(mut self, charge_path: PathBuf) -> Self {
-        self.charge_path = charge_path;
-        self
     }
 
     pub fn from_env() -> Self {
         let (config_path, backend): (PathBuf, LightingBackend) = runtime::from_env();
-        let charge_path: PathBuf = runtime::charge_path_from_env();
-        Self::new(config_path, backend).with_charge_path(charge_path)
+        Self::new(config_path, backend)
     }
 
     pub fn get(&self) -> Result<LightingConfig> {
@@ -79,48 +63,6 @@ impl Controller {
         Ok(None)
     }
 
-    /// Pin the charging indicator FIRST, then paint it directly (works even
-    /// if `run` is not active). Meant to be called by a suspend/wake hook
-    /// right before the device goes back to sleep.
-    ///
-    /// The order matters and is not cosmetic: if a `run` daemon happens to
-    /// be thawing in the same brief wake window, it re-checks the pin at the
-    /// top of every loop iteration (see `run` below). Painting hardware
-    /// BEFORE the pin exists would leave a window where `run` observes "no
-    /// pin" and repaints the *old* normal config right on top of what we
-    /// just painted — a real, observed race, not hypothetical. Writing the
-    /// pin first closes it: in the tightest possible race, `run` now either
-    /// still sees no pin (and hasn't repainted anything yet — fine, we paint
-    /// next) or already sees the pin and paints the *same* indicator config
-    /// itself — never the stale one.
-    pub fn charge_indicator_on(
-        &self,
-        color: Option<String>,
-        brightness: Option<u8>,
-    ) -> Result<ChargeIndicator> {
-        if let Some(reason) = self.backend.unsupported_reason() {
-            bail!("RGB unsupported: {reason}");
-        }
-        let indicator: ChargeIndicator = ChargeIndicator::new(color, brightness)?;
-        charging::save(&self.charge_path, &indicator)
-            .context("persist charge indicator override")?;
-        charging::apply_directly(&self.backend, &indicator).context("paint charge indicator")?;
-        Ok(indicator)
-    }
-
-    /// Clear the pin and restore the saved configuration immediately (does
-    /// not wait for a `run` daemon's next tick, which may not be running or
-    /// may still be thawing).
-    pub fn charge_indicator_off(&self) -> Result<LightingConfig> {
-        charging::clear(&self.charge_path).context("clear charge indicator override")?;
-        if let Some(reason) = self.backend.unsupported_reason() {
-            bail!("RGB unsupported: {reason}");
-        }
-        let config: LightingConfig = self.get()?;
-        self.backend.apply(&config)?;
-        Ok(config)
-    }
-
     /// Run the lighting daemon: keep the saved configuration painted, animate it
     /// when an effect is selected, and reload live whenever the config file
     /// changes (so a UI that writes `rgb.json` is reflected immediately). The
@@ -139,19 +81,6 @@ impl Controller {
         let start: Instant = Instant::now();
 
         loop {
-            // A pinned charge indicator (set by `charge-indicator on`, e.g. from
-            // a wake-on-charge-attach hook) wins over the normal configuration
-            // until cleared: paint only it, at a cheap 1s cadence, and skip the
-            // rest of the loop entirely so it is never raced by config reload
-            // or animation. See `crate::charging`.
-            if let Some(indicator) = charging::load(&self.charge_path) {
-                if let Err(error) = self.backend.apply(&indicator.to_config()) {
-                    eprintln!("armada-rgb: charge indicator apply failed: {error:#}");
-                }
-                sleep(Duration::from_secs(1));
-                continue;
-            }
-
             let current: Option<SystemTime> = config_mtime(&self.config_path);
             if current != seen {
                 seen = current;

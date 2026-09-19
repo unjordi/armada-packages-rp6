@@ -121,36 +121,31 @@ On any failure (no graphical session yet, timeout, decode error) the effect
 logs a one-time diagnostic and keeps showing the last successfully sampled
 colors (black before the first successful capture) instead of flickering.
 
-## Charging indicator (deep-sleep wake hook)
+## Charging indicator (deep-sleep, kernel-triggered)
 
-```text
-armada-rgb charge-indicator on [--color FFA500] [--brightness 15]
-armada-rgb charge-indicator off
-```
+During true deep suspend the CPU is powered off, so no userspace process can
+repaint the LEDs — but the LED controller hardware keeps holding whatever
+value was last written, and the kernel's LED trigger framework can drive the
+nodes on its own. The suspend/wake hook
+(`system_files/usr/lib/systemd/system-sleep/56-armada-rgb-suspend-charging`)
+therefore arms a **kernel trigger** rather than a CLI command:
 
-During true deep suspend the CPU is powered off, so nothing can drive an
-animation — but the LED controller hardware itself keeps holding whatever
-value was last written, with no help from software. A brief
-wake-on-charge-attach can therefore call `charge-indicator on` to paint a
-fixed, non-animated color directly to the hardware right before the system
-goes back to sleep; the hardware then holds it through the rest of the
-suspend on its own. `charge-indicator on` works even if `run` is not active
-(it writes to hardware directly) and, if `run` *is* thawed during the same
-brief wake window, pins that color so the daemon defers to it instead of
-racing to repaint the normal configuration over it — see `armada-rgb::charging`
-for the exact mechanism. It never touches `/etc/armada/rgb.json`: the user's
-own configuration is left untouched and is exactly what `charge-indicator off`
-restores, immediately (it does not wait for `run`'s next tick, which may not
-be running or may still be thawing). The pin lives at
-`/run/armada-rgb/charge.json` by default (tmpfs, overridable with
-`ARMADA_RGB_CHARGE_PATH`) so a pin left over from a crash mid-suspend cannot
-survive a reboot into a fresh session.
+- **pre-sleep** (opt-in): sets `keep_alive=1` on the RGB nodes and arms the
+  `battery-charging-orange-full-green` trigger on each `rgb:l?`/`rgb:r?` node,
+  so the hardware shows orange while charging and green when full, with no
+  software involved.
+- **post-wake**: clears the trigger (`none`) and `keep_alive=0`, then runs
+  `armada-rgb apply` to restore the user's normal configuration.
+
+There is no `charge-indicator` CLI subcommand and no `charge.json` pin: the
+kernel trigger is the single source of truth while the CPU is off, and
+`armada-rgb apply` is the single source of truth once it is back.
 
 ## Testing overrides
 
 For tests, the profile catalog and device model paths can be overridden with
 `ARMADA_RGB_PROFILES_PATH` and `ARMADA_RGB_MODEL_PATH`. The daemon additionally
-honors `ARMADA_RGB_CONFIG_PATH`, `ARMADA_RGB_CHARGE_PATH`, `ARMADA_RGB_SYSFS_ROOT`,
+honors `ARMADA_RGB_CONFIG_PATH`, `ARMADA_RGB_SYSFS_ROOT`,
 `ARMADA_RGB_STAT_PATH` (CPU load source), `ARMADA_RGB_POWER_ROOT` (battery
 source), `ARMADA_RGB_BACKLIGHT_ROOT` / `ARMADA_RGB_BACKLIGHT_NAME` (screen
 backlight source), and `ARMADA_RGB_SCREENSHOT_PATH` /
