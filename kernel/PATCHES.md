@@ -406,6 +406,27 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   busy/timeout) falls back to waking unconditionally rather than risk missing a real
   transition. SC8280XP/X1E80100 have no equivalent per-property fetch (they derive online
   from the battery status response) and keep the unconditional wake on every notification.
+  Missed-wakeup race closed the upstream way (2026-09-18): deferring the decision means
+  suspend could otherwise complete (freezing the workqueue) between the handler scheduling
+  the work and the work running, losing the attach. The handler takes a wakeup-source hold
+  with pm_stay_awake() before schedule_work() and each work run drops it with pm_relax() on
+  every exit path (goto relax:, never a bare return), so suspend cannot complete until the
+  decision is made; the hold is balanced against schedule_work() coalescing (one hold per
+  pending run, one pm_relax() per run) so an idle system with the cable in still suspends.
+  pm_stay_awake()/pm_wakeup_dev_event() take the wakeup source lock with spin_lock_irqsave(),
+  so they are safe on the RX callback under channel->recv_lock; the works run on the
+  unfreezable system_wq (a freezable queue would freeze exactly when the work must run to
+  decide). This is the client-side wakeup idiom upstream accepted for ucsi_glink
+  (device_init_wakeup + pm_wakeup_dev_event(hard=true) on the connector event; Jishnu
+  Prakash v2, 2026-07), extended with the pm_stay_awake()/pm_relax() hold because -- unlike
+  ucsi_glink, whose event is already an edge-like connector notification -- battmgr cannot
+  confirm the transition synchronously on the RX path and must defer. It is also the
+  per-channel-in-the-client selectivity Caleb Connolly asked for when rejecting the
+  transport-level glink-smem wakeup (0507, dropped). Teardown: a devm action registered
+  before devm_pmic_glink_client_alloc() cancel_work_sync()s both works on unbind; devm LIFO
+  deregisters the glink client first (stops new notifications), then cancels the works, then
+  tears down the wakeup source -- so a final pm_relax() from a cancelled-but-pending work
+  still has a live source, and no work dereferences the devm-freed battmgr (tristate).
   Obligate pair with 0903. QA-gated: the working assumption is that the PMIC/ADSP keeps
   charging autonomously once armed at plug-in, so the AP does not need to wake for every
   telemetry doorbell for current to keep flowing -- the physical QA at mid-SOC
