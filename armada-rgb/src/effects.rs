@@ -7,11 +7,56 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+// -- screen_sync (ambilight) efficiency knobs ------------------------------
+//
+// gamescope's screenshot IPC (`gamescope-control.xml`, request
+// `take_screenshot(path, type, flags)`) offers NO region, crop, or
+// resolution/downscale argument: `type` only picks base_plane_only /
+// all_real_layers / full_composition / screen_buffer, `flags` is a single
+// dummy bit, and the capture is always the full output resolution
+// (upstream feature request ValveSoftware/gamescope#284 is still open).
+// The written formats are png / avif / raw nv12.bin only -- no bmp -- so we
+// cannot ask the compositor for a smaller or cheaper artifact through
+// `gamescopectl screenshot`. That makes the two levers below the only
+// honest ways to keep this effect cheap:
+//
+//   1. CADENCE -- capture less often (each capture is a full-frame readback
+//      + PNG encode; cost scales with frequency, not with how much we read).
+//   2. EDGE-ONLY sampling -- the full frame is decoded regardless, but we
+//      only *read* the outer edge band on each side, which is both cheaper
+//      per frame and the correct ambilight source for the left/right stick
+//      LEDs.
+//
+// FUTURE (only if physical QA shows the compositor's PNG encode itself is
+// the bottleneck): request a raw `.nv12.bin` capture (no PNG encode on the
+// compositor side) and decode it here. Not done now -- it needs the panel
+// dimensions and a YUV->RGB path, and the `image` crate is built png-only.
+
+/// screen_sync capture cadence, in seconds. The PRIMARY efficiency knob (see
+/// the module note above): 3s keeps the effect a negligible background cost.
+/// Raise it if physical QA shows any thermal/CPU/battery impact -- the visual
+/// feel of a slower ambilight is a physical-QA call, so this stays a tunable
+/// constant rather than a config field.
+const SCREEN_SYNC_INTERVAL_SECS: f64 = 3.0;
+
+/// Fraction of the frame width sampled at EACH side for the ambilight
+/// average. gamescope cannot capture a region (see the module note), so the
+/// frame is decoded in full; this only bounds how much of it we read -- the
+/// outer ~8% of each side (approximately the panel border, ~30px on a
+/// ~400px-wide screenshot). Tunable; the feel is a physical-QA call.
+const SCREEN_SYNC_EDGE_FRACTION: f64 = 0.08;
+
+/// Hard timeout for a single screenshot capture. Kept comfortably under
+/// `SCREEN_SYNC_INTERVAL_SECS` so a slow capture just delays the next tick
+/// instead of two ever running back-to-back with zero gap.
+const SCREEN_SYNC_CAPTURE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// Animation applied to the base color.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -54,8 +99,9 @@ impl Effect {
             Effect::Battery => 2.0,
             // Sampling + decoding a screenshot is real CPU/IO work compared to
             // a sysfs read; keep this effect's own cadence slow on purpose so
-            // it cannot become a background thermal/CPU drain.
-            Effect::ScreenSync => 3.0,
+            // it cannot become a background thermal/CPU drain (see the module
+            // note on gamescope's capture limits).
+            Effect::ScreenSync => SCREEN_SYNC_INTERVAL_SECS,
             _ => 1.0 / f64::from(fps.max(1)),
         }
     }
@@ -338,9 +384,9 @@ impl EffectState {
         }
     }
 
-    /// Per-side (left/right) average color of the current screen contents,
-    /// spread across `count` targets (first half = left average, second half
-    /// = right average). On any capture failure, keeps returning the last
+    /// Per-side (left/right) average color of the current screen EDGES,
+    /// spread across `count` targets (first half = left edge average, second
+    /// half = right edge average). On any capture failure, keeps returning the last
     /// successfully sampled colors (black before the first successful
     /// capture) instead of flickering — see [`Effect::ScreenSync`].
     fn sample_screen_colors(&mut self, count: usize) -> Vec<[u8; 3]> {
@@ -388,7 +434,7 @@ impl EffectState {
         let image = image::open(&self.screenshot_path)
             .map_err(|error| format!("decode {}: {error}", self.screenshot_path.display()))?
             .to_rgb8();
-        Ok(average_left_right(&image))
+        Ok(average_edges(&image, SCREEN_SYNC_EDGE_FRACTION))
     }
 }
 
@@ -463,8 +509,18 @@ fn read_u32(path: &Path) -> Option<u32> {
 /// of its own, so it cannot rely on inherited environment variables. Bounded
 /// by a hard timeout so a wedged compositor cannot hang the whole daemon
 /// (config reload and every other effect share this same loop thread): on
-/// timeout the child is killed and reaped, never left running or awaited
-/// indefinitely, so this never blocks `run` past `TIMEOUT` either way.
+/// timeout the whole child PROCESS GROUP is killed and reaped, never left
+/// running or awaited indefinitely, so this never blocks `run` past the
+/// timeout either way.
+///
+/// The child runs in its own process group (`process_group(0)`) so the
+/// timeout can reap the entire tree, not just the direct child (A-M3): the
+/// `su` path forks a login shell that in turn forks `gamescopectl`, so a
+/// plain `child.kill()` would signal only `su` and leave `gamescopectl`
+/// running — a real leak once per wedged capture. Every value interpolated
+/// into the `su -c` shell string is single-quoted (B1) so a path or env
+/// value containing a space or shell metacharacter can neither word-split
+/// nor be interpreted by the login shell.
 fn run_screenshot_command(
     bin: &str,
     path: &Path,
@@ -472,20 +528,17 @@ fn run_screenshot_command(
     wayland_display: &str,
     su_user: Option<&str>,
 ) -> Result<(), String> {
-    // A busy compositor (e.g. a game in fullscreen) can take noticeably
-    // longer than an idle one to service a screenshot request; keep this
-    // comfortably under Effect::ScreenSync's own 3s cadence (see
-    // `Effect::frame_interval`) so a slow capture just delays the next tick
-    // instead of the two ever running back-to-back with zero gap.
-    const TIMEOUT: Duration = Duration::from_millis(2500);
     const POLL: Duration = Duration::from_millis(50);
+    let timeout: Duration = SCREEN_SYNC_CAPTURE_TIMEOUT;
 
     let mut command: Command = match su_user {
         Some(user) => {
             let mut command = Command::new("su");
-            command.arg("-").arg(user).arg("-c").arg(format!(
-                "env XDG_RUNTIME_DIR={xdg_runtime_dir} WAYLAND_DISPLAY={wayland_display} {bin} screenshot {}",
-                path.display()
+            command.arg("-").arg(user).arg("-c").arg(su_screenshot_script(
+                bin,
+                path,
+                xdg_runtime_dir,
+                wayland_display,
             ));
             command
         }
@@ -500,20 +553,25 @@ fn run_screenshot_command(
         }
     };
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // A-M3: own process group so a timeout can kill the whole tree.
+    command.process_group(0);
 
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn {bin}: {error}"))?;
+    // With `process_group(0)` the child's PID is also its process-group id,
+    // so `-pgid` in `kill(2)` targets the child and every descendant.
+    let pgid: i32 = child.id() as i32;
 
-    let deadline: Instant = Instant::now() + TIMEOUT;
+    let deadline: Instant = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_status)) => break,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_process_group(pgid);
                     let _ = child.wait();
-                    return Err(format!("{bin} screenshot timed out after {TIMEOUT:?}"));
+                    return Err(format!("{bin} screenshot timed out after {timeout:?}"));
                 }
                 sleep(POLL);
             }
@@ -533,38 +591,99 @@ fn run_screenshot_command(
     Ok(())
 }
 
-/// Average RGB of the left and right halves of the image, sampled on a
-/// bounded grid (never more than ~64 samples per axis) so decoding a large
-/// screenshot cannot itself become the CPU cost this effect is gated against.
-fn average_left_right(image: &image::RgbImage) -> ([u8; 3], [u8; 3]) {
+/// Build the argument passed to `su - <user> -c` that runs the screenshot
+/// with the Wayland session env. Every interpolated value is single-quoted
+/// (B1) so a path or env value with a space or shell metacharacter neither
+/// word-splits nor is interpreted by the login shell.
+fn su_screenshot_script(
+    bin: &str,
+    path: &Path,
+    xdg_runtime_dir: &str,
+    wayland_display: &str,
+) -> String {
+    format!(
+        "env XDG_RUNTIME_DIR={} WAYLAND_DISPLAY={} {} screenshot {}",
+        sh_single_quote(xdg_runtime_dir),
+        sh_single_quote(wayland_display),
+        sh_single_quote(bin),
+        sh_single_quote(&path.display().to_string()),
+    )
+}
+
+/// POSIX single-quote a value for a `/bin/sh` command line: wrap it in
+/// `'...'` and turn each embedded `'` into `'\''` (close quote, escaped
+/// quote, reopen). Safe for any byte sequence a path/env value can hold.
+fn sh_single_quote(value: &str) -> String {
+    let mut quoted: String = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// SIGKILL an entire process group (A-M3). `pgid` is the group id (== the
+/// spawned child's PID, because it was started with `process_group(0)`), so
+/// the negative pid passed to `kill(2)` reaches the child and every
+/// descendant — including a `gamescopectl` forked by the `su` login shell,
+/// which a plain `child.kill()` on `su` alone would orphan. Best-effort:
+/// any error is ignored (the process may already have exited).
+fn kill_process_group(pgid: i32) {
+    // SAFETY: `kill(2)` with a negative pid is a plain libc call with no
+    // memory effects; a stale/exited group just returns ESRCH.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+/// Average RGB of the outer LEFT and RIGHT edge bands of the image — the
+/// ambilight source for the left/right stick LEDs. gamescope cannot capture
+/// a region (see the module note), so the full frame is decoded, but only
+/// the outer `edge_fraction` of the width on each side is *read*, on a
+/// bounded grid (never more than ~64 samples per axis) so decoding/sampling
+/// a large screenshot cannot itself become the CPU cost this effect is gated
+/// against. `edge_fraction` is clamped so the two bands never overlap even on
+/// a pathologically narrow frame.
+fn average_edges(image: &image::RgbImage, edge_fraction: f64) -> ([u8; 3], [u8; 3]) {
     let (width, height): (u32, u32) = image.dimensions();
     if width == 0 || height == 0 {
         return ([0, 0, 0], [0, 0, 0]);
     }
-    let mid: u32 = width / 2;
+    let fraction: f64 = edge_fraction.clamp(0.0, 0.5);
+    // At least one column per side; never let the two bands overlap.
+    let edge: u32 = ((f64::from(width) * fraction).round() as u32).clamp(1, (width / 2).max(1));
     let step: u32 = (width.max(height) / 64).max(1);
 
-    let mut left_sum: [u64; 3] = [0; 3];
-    let mut left_n: u64 = 0;
-    let mut right_sum: [u64; 3] = [0; 3];
-    let mut right_n: u64 = 0;
+    let left: [u8; 3] = average_band(image, 0, edge, height, step);
+    let right: [u8; 3] = average_band(image, width - edge, width, height, step);
+    (left, right)
+}
 
+/// Average RGB over the columns `[x0, x1)` across the full height, on a grid
+/// of stride `step`. Always takes at least one sample (the band is non-empty
+/// and `height >= 1`).
+fn average_band(image: &image::RgbImage, x0: u32, x1: u32, height: u32, step: u32) -> [u8; 3] {
+    let mut sum: [u64; 3] = [0; 3];
+    let mut n: u64 = 0;
     let mut y: u32 = 0;
     while y < height {
-        let mut x: u32 = 0;
-        while x < width {
+        let mut x: u32 = x0;
+        while x < x1 {
             let pixel = image.get_pixel(x, y);
-            let (sum, n): (&mut [u64; 3], &mut u64) =
-                if x < mid { (&mut left_sum, &mut left_n) } else { (&mut right_sum, &mut right_n) };
             sum[0] += u64::from(pixel[0]);
             sum[1] += u64::from(pixel[1]);
             sum[2] += u64::from(pixel[2]);
-            *n += 1;
+            n += 1;
             x += step;
         }
         y += step;
     }
-    (average(left_sum, left_n), average(right_sum, right_n))
+    average(sum, n)
 }
 
 fn average(sum: [u64; 3], n: u64) -> [u8; 3] {
@@ -882,5 +1001,86 @@ mod tests {
         state.gamescopectl_bin = script.to_string_lossy().into_owned();
         let (frame, _) = state.render(Effect::ScreenSync, [0, 0, 0], 100, 100, 0.0, 4);
         assert_eq!(frame.expand(4), vec![[10, 20, 30], [10, 20, 30], [40, 50, 60], [40, 50, 60]]);
+    }
+
+    // -- efficient edge sampling (armada#27) ---------------------------------
+
+    /// Build a WxH image with distinct left-edge / center / right-edge colors.
+    fn banded_image(
+        width: u32,
+        height: u32,
+        edge: u32,
+        left: [u8; 3],
+        center: [u8; 3],
+        right: [u8; 3],
+    ) -> image::RgbImage {
+        let mut img = image::RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let color = if x < edge {
+                    left
+                } else if x >= width - edge {
+                    right
+                } else {
+                    center
+                };
+                img.put_pixel(x, y, image::Rgb(color));
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn average_edges_reads_only_the_borders_not_the_center() {
+        // A wide frame whose center is a loud color the ambilight must ignore.
+        let img = banded_image(10, 4, 2, [255, 0, 0], [0, 255, 0], [0, 0, 255]);
+        let (left, right) = average_edges(&img, 0.2); // 0.2 * 10 = 2 cols per side
+        assert_eq!(left, [255, 0, 0], "left ring follows the left border, not the green center");
+        assert_eq!(right, [0, 0, 255], "right ring follows the right border, not the green center");
+    }
+
+    #[test]
+    fn average_edges_always_samples_at_least_one_column_per_side() {
+        // Fraction rounds to zero, but each side must still yield a sample.
+        let img = banded_image(20, 3, 1, [10, 10, 10], [99, 99, 99], [20, 20, 20]);
+        let (left, right) = average_edges(&img, 0.0);
+        assert_eq!(left, [10, 10, 10]);
+        assert_eq!(right, [20, 20, 20]);
+    }
+
+    #[test]
+    fn average_edges_does_not_panic_on_a_one_pixel_frame() {
+        let mut img = image::RgbImage::new(1, 1);
+        img.put_pixel(0, 0, image::Rgb([7, 8, 9]));
+        let (left, right) = average_edges(&img, 0.08);
+        assert_eq!(left, [7, 8, 9]);
+        assert_eq!(right, [7, 8, 9]);
+    }
+
+    // -- su -c shell quoting (B1) --------------------------------------------
+
+    #[test]
+    fn sh_single_quote_wraps_and_escapes() {
+        assert_eq!(sh_single_quote("abc"), "'abc'");
+        assert_eq!(sh_single_quote(""), "''");
+        assert_eq!(sh_single_quote("a b"), "'a b'"); // space stays inside one quote
+        assert_eq!(sh_single_quote("it's"), "'it'\\''s'"); // embedded quote escaped
+        assert_eq!(sh_single_quote("a;b|c$(x)"), "'a;b|c$(x)'"); // metachars inert
+    }
+
+    #[test]
+    fn su_screenshot_script_quotes_every_interpolated_value() {
+        let script = su_screenshot_script(
+            "gamescopectl",
+            Path::new("/run/armada-rgb/screen sync.png"),
+            "/run/user/1000",
+            "gamescope-0",
+        );
+        assert_eq!(
+            script,
+            "env XDG_RUNTIME_DIR='/run/user/1000' WAYLAND_DISPLAY='gamescope-0' \
+             'gamescopectl' screenshot '/run/armada-rgb/screen sync.png'",
+            "the path's space must stay a single argument, not word-split"
+        );
     }
 }
