@@ -320,7 +320,13 @@ fn write_channels(targets: &mut [PreparedChannel]) -> Result<()> {
 
 fn write_colors(targets: &mut [PreparedTarget]) -> Result<()> {
     for target in targets {
-        let (file, value) = target.color.as_mut().expect("prepared color");
+        // Invariant: `prepare` only calls these helpers when `config.enabled`,
+        // in which case it always sets `color`. A missing value would be a
+        // programming error, not a runtime I/O failure — surface it as a clear
+        // error instead of an opaque panic.
+        let Some((file, value)) = target.color.as_mut() else {
+            bail!("internal: target '{}' has no prepared color (expected when enabled)", target.name);
+        };
         write_attr(file, value).with_context(|| format!("write {} color", target.name))?;
     }
     Ok(())
@@ -328,7 +334,9 @@ fn write_colors(targets: &mut [PreparedTarget]) -> Result<()> {
 
 fn write_brightness(targets: &mut [PreparedTarget]) -> Result<()> {
     for target in targets {
-        let (file, value) = target.brightness.as_mut().expect("prepared brightness");
+        let Some((file, value)) = target.brightness.as_mut() else {
+            bail!("internal: target '{}' has no prepared brightness (expected when enabled)", target.name);
+        };
         write_attr(file, value).with_context(|| format!("write {} brightness", target.name))?;
     }
     Ok(())
