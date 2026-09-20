@@ -396,7 +396,7 @@ fn sync_brightness_cli_toggle_persists_and_run_scales_on_top_of_static() {
     // Color untouched (full-scale gamma of pure green); only the separate
     // `brightness` attribute is scaled by the 50% backlight fixture.
     assert_eq!(fixture.value("rgb:l1", "multi_intensity"), "0 255 0");
-    assert_eq!(fixture.value("rgb:l1", "brightness"), "102"); // scale(80 * 50%, 255) = scale(40, 255)
+    assert_eq!(fixture.value("rgb:l1", "brightness"), "89"); // QG-5: scale(round(80*50%*0.88)=35, 255) = 89 (LED -12% under panel)
 
     // Turning it back off restores the unscaled brightness on the next tick.
     let mut command: Command = fixture.command("multicolor", &["rgb:l1"], None);
