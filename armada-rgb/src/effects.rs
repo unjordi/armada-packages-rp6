@@ -268,13 +268,25 @@ impl EffectState {
                 (Frame::Uniform(hsv_to_rgb(hue, 1.0, 1.0)), brightness)
             }
             Effect::Battery => {
-                let pct: f64 = self.read_battery().unwrap_or(100) as f64 / 100.0;
-                // Red (0.0) empty → green (0.33) full.
-                let hue: f64 = pct * 0.33;
-                (Frame::Uniform(hsv_to_rgb(hue, 1.0, 1.0)), brightness)
+                let (pct, status): (f64, Option<String>) = match self.read_battery() {
+                    Some(capacity) => {
+                        let status: Option<String> = self.read_battery_status();
+                        (capacity as f64 / 100.0, status)
+                    }
+                    None => (1.0, None),
+                };
+                let color: [u8; 3] = match status.as_deref() {
+                    Some("Charging") => hsv_to_rgb(0.11, 1.0, 1.0), // amber: charging
+                    Some("Full") => hsv_to_rgb(0.33, 1.0, 1.0),     // green: full
+                    _ => {
+                        // Discharging / unknown: red (0.0) empty → green (0.33) full.
+                        hsv_to_rgb(pct * 0.33, 1.0, 1.0)
+                    }
+                };
+                (Frame::Uniform(color), brightness)
             }
             Effect::ScreenSync => {
-                let colors: Vec<[u8; 3]> = self.sample_screen_colors(count);
+                let colors: Vec<[u8; 3]> = self.sample_screen_colors(count, base);
                 (Frame::PerTarget(colors), brightness)
             }
         }
@@ -319,6 +331,27 @@ impl EffectState {
         None
     }
 
+    /// Battery charge status (`Charging` / `Full` / `Discharging` / …) from
+    /// the same power_supply node, if readable. QG-3: the daemon disarms the
+    /// kernel charging trigger on every write (see `reclaim_led` in
+    /// `backend.rs`), so the LED cannot rely on the kernel to paint the
+    /// charge state — the effect reads `status` itself and paints amber
+    /// (charging), green (full), or the capacity gradient (discharging).
+    fn read_battery_status(&self) -> Option<String> {
+        let entries = fs::read_dir(&self.battery_path).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let kind = fs::read_to_string(path.join("type")).ok()?;
+            if kind.trim() != "Battery" {
+                continue;
+            }
+            if let Ok(status) = fs::read_to_string(path.join("status")) {
+                return Some(status.trim().to_string());
+            }
+        }
+        None
+    }
+
     /// Scale `brightness` (whatever the active effect already computed —
     /// this runs in the shared write path, not inside any one effect) by the
     /// live screen backlight percentage when `sync_brightness` is enabled.
@@ -330,7 +363,10 @@ impl EffectState {
             return brightness;
         }
         let pct: f64 = self.sample_backlight_pct();
-        (f64::from(brightness) * pct).round().min(100.0) as u8
+        // QG-5: the LED panel reads ~12% brighter than the screen panel at
+        // the same backlight percentage, so scale the LED brightness down by
+        // 12% (×0.88) to match the perceived screen brightness.
+        (f64::from(brightness) * pct * 0.88).round().min(100.0) as u8
     }
 
     /// Screen backlight as a `0.0..=1.0` fraction. Falls back to `1.0`
@@ -387,9 +423,11 @@ impl EffectState {
     /// Per-side (left/right) average color of the current screen EDGES,
     /// spread across `count` targets (first half = left edge average, second
     /// half = right edge average). On any capture failure, keeps returning the last
-    /// successfully sampled colors (black before the first successful
-    /// capture) instead of flickering — see [`Effect::ScreenSync`].
-    fn sample_screen_colors(&mut self, count: usize) -> Vec<[u8; 3]> {
+    /// successfully sampled colors (or the configured `base` color before the
+    /// first successful capture) instead of flickering to black — see
+    /// [`Effect::ScreenSync`]. QG-2: a persistent capture failure must never
+    /// leave the LEDs dark; falling back to `base` keeps them visible.
+    fn sample_screen_colors(&mut self, count: usize, base: [u8; 3]) -> Vec<[u8; 3]> {
         match self.capture_screen_split() {
             Ok((left, right)) => {
                 self.last_left = left;
@@ -399,13 +437,18 @@ impl EffectState {
             Err(reason) => {
                 if !self.screen_sync_warned {
                     eprintln!(
-                        "armada-rgb: screen_sync capture failed ({reason}); keeping the last \
-                         known colors. If this is not transient (e.g. no graphical session yet), \
-                         check ARMADA_RGB_GAMESCOPECTL_BIN, ARMADA_RGB_GAMESCOPE_XDG_RUNTIME_DIR, \
-                         ARMADA_RGB_GAMESCOPE_WAYLAND_DISPLAY, and ARMADA_RGB_SCREEN_SYNC_USER."
+                        "armada-rgb: screen_sync capture failed ({reason}); falling back to the \
+                         configured base color. If this is not transient (e.g. no graphical \
+                         session yet), check ARMADA_RGB_GAMESCOPECTL_BIN, \
+                         ARMADA_RGB_GAMESCOPE_XDG_RUNTIME_DIR, ARMADA_RGB_GAMESCOPE_WAYLAND_DISPLAY, \
+                         and ARMADA_RGB_SCREEN_SYNC_USER."
                     );
                     self.screen_sync_warned = true;
                 }
+                // QG-2: never paint black on capture failure — use the base color
+                // so the LEDs stay visible.
+                self.last_left = base;
+                self.last_right = base;
             }
         }
         let left_count: usize = count / 2;
@@ -842,7 +885,7 @@ mod tests {
         // Same math whether the 80 came from a plain static config or from an
         // effect's own computed brightness (e.g. mid-breath) — scale_for_sync
         // does not know or care which.
-        assert_eq!(state.scale_for_sync(80, true), 40); // 80 ceiling * 50% backlight
+        assert_eq!(state.scale_for_sync(80, true), 35); // 80 ceiling * 50% backlight * 0.88 (QG-5)
     }
 
     #[test]
@@ -858,7 +901,7 @@ mod tests {
             backlight_name: None,
             ..EffectState::default()
         };
-        assert_eq!(state.scale_for_sync(100, true), 90);
+        assert_eq!(state.scale_for_sync(100, true), 79); // 90% backlight * 0.88 (QG-5)
     }
 
     #[test]
@@ -872,7 +915,7 @@ mod tests {
             backlight_name: Some("backlight".into()),
             ..EffectState::default()
         };
-        assert_eq!(state.scale_for_sync(100, true), 10);
+        assert_eq!(state.scale_for_sync(100, true), 9); // 10% backlight * 0.88 (QG-5)
     }
 
     #[test]
@@ -883,7 +926,7 @@ mod tests {
             backlight_name: None,
             ..EffectState::default()
         };
-        assert_eq!(state.scale_for_sync(55, true), 55);
+        assert_eq!(state.scale_for_sync(55, true), 48); // 55 * 1.0 (no backlight) * 0.88 (QG-5)
     }
 
     #[test]
