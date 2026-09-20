@@ -8,7 +8,6 @@ description = "RGB lighting controller for Armada"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
 # Process-group kill for the screen_sync capture timeout (effects.rs
 # kill_process_group / A-M3): std has no kill-by-pgid, only Child::kill().
 libc = "0.2"
