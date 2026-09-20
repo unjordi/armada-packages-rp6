@@ -121,8 +121,14 @@ to `/run/user/1000` and `gamescope-0` (override with
 `ARMADA_RGB_GAMESCOPE_XDG_RUNTIME_DIR` / `ARMADA_RGB_GAMESCOPE_WAYLAND_DISPLAY`
 if a device differs). If direct env injection cannot reach the session's
 Wayland socket on some device, set `ARMADA_RGB_SCREEN_SYNC_USER` to run the
-capture through `su - <user> -c '...'` instead (e.g. the session user, so it
-runs with that user's environment rather than root's). `gamescopectl` itself
+capture through `runuser -u <user> -- ...` instead (e.g. the session user, so
+it runs with that user's environment rather than root's). Deliberately
+`runuser`, not `su -`/`su -l`: a login shell opens a brand-new PAM/logind
+session on every call, and at the 3s screen_sync cadence that floods logind
+badly enough to starve out the real Game Mode session (confirmed on-device:
+~34 session-opens/90s, Game Mode failed to start until the flood was
+stopped). `runuser -u <user> --` execs the target directly as that user with
+no login/PAM session at all. `gamescopectl` itself
 is resolved via `ARMADA_RGB_GAMESCOPECTL_BIN` (default: `gamescopectl` on
 `PATH`) and the captured NV12 buffer is written to `ARMADA_RGB_SCREENSHOT_PATH`
 (default: `/run/armada-rgb/screen-sync.nv12.bin`, tmpfs, to avoid wearing flash

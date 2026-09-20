@@ -203,11 +203,19 @@ pub struct EffectState {
     gamescopectl_bin: String,
     gamescope_runtime_dir: String,
     gamescope_wayland_display: String,
-    /// Optional `su - <user> -c '...'` wrapper: `armada-rgb run` is a system
-    /// service with no graphical session env of its own (see the module doc
-    /// on `Effect::ScreenSync`); if setting `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`
-    /// directly is not enough on some device, this switches to the session
-    /// user without a rebuild.
+    /// Optional `runuser -u <user> -- ...` wrapper: `armada-rgb run` is a
+    /// system service with no graphical session env of its own (see the
+    /// module doc on `Effect::ScreenSync`); if setting
+    /// `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY` directly is not enough on some
+    /// device, this switches to the session user without a rebuild.
+    /// Deliberately `runuser`, not `su -`/`su -l`: those open a full login
+    /// shell, which goes through pam_systemd and registers a brand-new
+    /// logind session on every call — at the 3s screen_sync cadence that
+    /// floods logind (measured live: ~34 session-opens/90s) and can starve
+    /// out the real Game Mode session, causing it to fail to start
+    /// (confirmed on-device: killing the flood restored Game Mode).
+    /// `runuser -u <user> --` runs the target directly as that user without
+    /// opening a login/PAM session at all.
     screen_sync_user: Option<String>,
     /// Composited output geometry, used to interpret the raw NV12 capture.
     /// A wrong value fails the size check in `Nv12Layout::resolve` and falls
@@ -746,38 +754,37 @@ fn read_u32(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Run `<bin> screenshot <path>` (or, if `su_user` is set, the same command
-/// through `su - <user> -c '...'`) with the Wayland session env explicitly
-/// set — `armada-rgb run` is a system service with no graphical session env
-/// of its own, so it cannot rely on inherited environment variables. Bounded
-/// by a hard timeout so a wedged compositor cannot hang the whole daemon
-/// (config reload and every other effect share this same loop thread): on
-/// timeout the whole child PROCESS GROUP is killed and reaped, never left
-/// running or awaited indefinitely, so this never blocks `run` past the
-/// timeout either way.
+/// Run `<bin> screenshot <path>` (or, if `run_as_user` is set, the same command
+/// through `runuser -u <user> -- ...`) with the Wayland session env
+/// explicitly set — `armada-rgb run` is a system service with no graphical
+/// session env of its own, so it cannot rely on inherited environment
+/// variables. Bounded by a hard timeout so a wedged compositor cannot hang
+/// the whole daemon (config reload and every other effect share this same
+/// loop thread): on timeout the whole child PROCESS GROUP is killed and
+/// reaped, never left running or awaited indefinitely, so this never blocks
+/// `run` past the timeout either way.
 ///
 /// The child runs in its own process group (`process_group(0)`) so the
-/// timeout can reap the entire tree, not just the direct child (A-M3): the
-/// `su` path forks a login shell that in turn forks `gamescopectl`, so a
-/// plain `child.kill()` would signal only `su` and leave `gamescopectl`
-/// running — a real leak once per wedged capture. Every value interpolated
-/// into the `su -c` shell string is single-quoted (B1) so a path or env
-/// value containing a space or shell metacharacter can neither word-split
-/// nor be interpreted by the login shell.
+/// timeout can reap the entire tree, not just the direct child (A-M3): even
+/// though `runuser -u <user> --` execs the target directly (no login shell,
+/// no extra fork the way `su -`'s shell used to add), keeping the group-kill
+/// is cheap defense-in-depth against a `gamescopectl` that itself forks.
+/// The `runuser` argv is built directly (no shell string, so no shell
+/// quoting/injection surface at all — see `runuser_screenshot_args`).
 fn run_screenshot_command(
     bin: &str,
     path: &Path,
     xdg_runtime_dir: &str,
     wayland_display: &str,
-    su_user: Option<&str>,
+    run_as_user: Option<&str>,
 ) -> Result<(), String> {
     const POLL: Duration = Duration::from_millis(50);
     let timeout: Duration = SCREEN_SYNC_CAPTURE_TIMEOUT;
 
-    let mut command: Command = match su_user {
+    let mut command: Command = match run_as_user {
         Some(user) => {
-            let mut command = Command::new("su");
-            command.arg("-").arg(user).arg("-c").arg(su_screenshot_script(
+            let mut command = Command::new("runuser");
+            command.arg("-u").arg(user).arg("--").args(runuser_screenshot_args(
                 bin,
                 path,
                 xdg_runtime_dir,
@@ -858,47 +865,35 @@ fn run_screenshot_command(
     }
 }
 
-/// Build the argument passed to `su - <user> -c` that runs the screenshot
-/// with the Wayland session env. Every interpolated value is single-quoted
-/// (B1) so a path or env value with a space or shell metacharacter neither
-/// word-splits nor is interpreted by the login shell.
-fn su_screenshot_script(
+/// Build the argv passed to `runuser -u <user> --` that runs the screenshot
+/// with the Wayland session env, mirroring `env VAR=val ... <bin> screenshot
+/// <path>`. Returned as a `Vec<String>`, one OS argv entry per element —
+/// `runuser -u <user> -- <argv...>` execs the target directly, with NO shell
+/// in between, so no value here is ever parsed/word-split/interpreted: a
+/// path or env value containing a space or shell metacharacter is passed
+/// through byte-for-byte as its own argument. That is strictly safer than
+/// (and replaces) the old `su -c` shell-string + single-quoting approach.
+fn runuser_screenshot_args(
     bin: &str,
     path: &Path,
     xdg_runtime_dir: &str,
     wayland_display: &str,
-) -> String {
-    format!(
-        "env XDG_RUNTIME_DIR={} WAYLAND_DISPLAY={} {} screenshot {}",
-        sh_single_quote(xdg_runtime_dir),
-        sh_single_quote(wayland_display),
-        sh_single_quote(bin),
-        sh_single_quote(&path.display().to_string()),
-    )
-}
-
-/// POSIX single-quote a value for a `/bin/sh` command line: wrap it in
-/// `'...'` and turn each embedded `'` into `'\''` (close quote, escaped
-/// quote, reopen). Safe for any byte sequence a path/env value can hold.
-fn sh_single_quote(value: &str) -> String {
-    let mut quoted: String = String::with_capacity(value.len() + 2);
-    quoted.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
+) -> Vec<String> {
+    vec![
+        "env".to_string(),
+        format!("XDG_RUNTIME_DIR={xdg_runtime_dir}"),
+        format!("WAYLAND_DISPLAY={wayland_display}"),
+        bin.to_string(),
+        "screenshot".to_string(),
+        path.display().to_string(),
+    ]
 }
 
 /// SIGKILL an entire process group (A-M3). `pgid` is the group id (== the
 /// spawned child's PID, because it was started with `process_group(0)`), so
 /// the negative pid passed to `kill(2)` reaches the child and every
-/// descendant — including a `gamescopectl` forked by the `su` login shell,
-/// which a plain `child.kill()` on `su` alone would orphan. Best-effort:
+/// descendant — cheap defense-in-depth in case `gamescopectl` itself forks;
+/// a plain `child.kill()` would signal only the direct child. Best-effort:
 /// any error is ignored (the process may already have exited).
 fn kill_process_group(pgid: i32) {
     // SAFETY: `kill(2)` with a negative pid is a plain libc call with no
@@ -1478,30 +1473,42 @@ mod tests {
         }
     }
 
-    // -- su -c shell quoting (B1) --------------------------------------------
+    // -- runuser argv (no shell involved) --------------------------------------
 
     #[test]
-    fn sh_single_quote_wraps_and_escapes() {
-        assert_eq!(sh_single_quote("abc"), "'abc'");
-        assert_eq!(sh_single_quote(""), "''");
-        assert_eq!(sh_single_quote("a b"), "'a b'"); // space stays inside one quote
-        assert_eq!(sh_single_quote("it's"), "'it'\\''s'"); // embedded quote escaped
-        assert_eq!(sh_single_quote("a;b|c$(x)"), "'a;b|c$(x)'"); // metachars inert
-    }
-
-    #[test]
-    fn su_screenshot_script_quotes_every_interpolated_value() {
-        let script = su_screenshot_script(
+    fn runuser_screenshot_args_builds_one_argv_entry_per_value() {
+        let args = runuser_screenshot_args(
             "gamescopectl",
             Path::new("/run/armada-rgb/screen sync.png"),
             "/run/user/1000",
             "gamescope-0",
         );
         assert_eq!(
-            script,
-            "env XDG_RUNTIME_DIR='/run/user/1000' WAYLAND_DISPLAY='gamescope-0' \
-             'gamescopectl' screenshot '/run/armada-rgb/screen sync.png'",
-            "the path's space must stay a single argument, not word-split"
+            args,
+            vec![
+                "env".to_string(),
+                "XDG_RUNTIME_DIR=/run/user/1000".to_string(),
+                "WAYLAND_DISPLAY=gamescope-0".to_string(),
+                "gamescopectl".to_string(),
+                "screenshot".to_string(),
+                "/run/armada-rgb/screen sync.png".to_string(),
+            ],
+            "no shell is involved (direct execve via runuser), so a space in the \
+             path must stay verbatim as its own OS argv entry — never quoted, \
+             never word-split"
         );
+    }
+
+    #[test]
+    fn runuser_screenshot_args_never_needs_shell_quoting() {
+        // Shell metacharacters must survive completely inert: they are just
+        // bytes in an OS argv entry, never seen by a shell parser.
+        let args = runuser_screenshot_args(
+            "gamescopectl",
+            Path::new("/tmp/a;b|c$(x).png"),
+            "/run/user/1000",
+            "gamescope-0",
+        );
+        assert_eq!(args.last().unwrap(), "/tmp/a;b|c$(x).png");
     }
 }
