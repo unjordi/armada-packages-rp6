@@ -1,7 +1,7 @@
 //! Command line interface for RGB lighting.
 
 use anyhow::Result;
-use armada_rgb::{ColorCorrection, Controller, Effect, LightingConfig};
+use armada_rgb::{ColorCorrection, Controller, Effect, EffectState, LightingConfig, ScreenSyncProbe};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -51,6 +51,16 @@ enum Command {
     SyncBrightness {
         #[command(subcommand)]
         state: SyncBrightnessState,
+    },
+    /// Diagnostic/benchmark: run one or more instrumented `screen_sync`
+    /// captures and print the compositor-capture time, the read+sample time
+    /// (no PNG decode), the raw NV12 size, the resolved geometry, and the
+    /// sampled left/right edge colors. Uses the same env overrides as `run`.
+    #[command(hide = true)]
+    ScreenSyncProbe {
+        /// How many captures to take.
+        #[arg(long, default_value_t = 5)]
+        iterations: u32,
     },
 }
 
@@ -120,6 +130,30 @@ fn main() -> Result<()> {
             config.sync_brightness = matches!(state, SyncBrightnessState::On);
             let config: LightingConfig = controller.set(config)?;
             println!("{}", serde_json::to_string_pretty(&config)?);
+        }
+        Command::ScreenSyncProbe { iterations } => {
+            let state: EffectState = EffectState::default();
+            for i in 0..iterations {
+                match state.probe_screen_sync() {
+                    Ok(ScreenSyncProbe {
+                        capture_ms,
+                        process_ms,
+                        bytes,
+                        width,
+                        height,
+                        uv_offset,
+                        left,
+                        right,
+                    }) => {
+                        println!(
+                            "probe {i}: capture={capture_ms:.1}ms process={process_ms:.2}ms \
+                             bytes={bytes} geom={width}x{height} uv_offset={uv_offset} \
+                             left={left:?} right={right:?}"
+                        );
+                    }
+                    Err(reason) => println!("probe {i}: FAILED: {reason}"),
+                }
+            }
         }
     }
     Ok(())

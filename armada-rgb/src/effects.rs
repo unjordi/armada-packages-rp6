@@ -22,36 +22,67 @@ use std::time::{Duration, Instant};
 // all_real_layers / full_composition / screen_buffer, `flags` is a single
 // dummy bit, and the capture is always the full output resolution
 // (upstream feature request ValveSoftware/gamescope#284 is still open).
-// The written formats are png / avif / raw nv12.bin only -- no bmp -- so we
-// cannot ask the compositor for a smaller or cheaper artifact through
-// `gamescopectl screenshot`. That makes the two levers below the only
-// honest ways to keep this effect cheap:
+// The written formats are png / avif / raw nv12.bin only -- no bmp.
 //
-//   1. CADENCE -- capture less often (each capture is a full-frame readback
-//      + PNG encode; cost scales with frequency, not with how much we read).
-//   2. EDGE-ONLY sampling -- the full frame is decoded regardless, but we
-//      only *read* the outer edge band on each side, which is both cheaper
-//      per frame and the correct ambilight source for the left/right stick
-//      LEDs.
+// So the compositor always reads back the whole frame; the levers we DO have
+// are (a) not paying for a PNG encode+decode round-trip, and (b) only reading
+// the outer edge bands we actually need:
 //
-// FUTURE (only if physical QA shows the compositor's PNG encode itself is
-// the bottleneck): request a raw `.nv12.bin` capture (no PNG encode on the
-// compositor side) and decode it here. Not done now -- it needs the panel
-// dimensions and a YUV->RGB path, and the `image` crate is built png-only.
+//   1. RAW NV12 capture -- request `<path>.nv12.bin` instead of `.png`. The
+//      extension is what tells gamescope which encoder to use, and NV12 is
+//      the compositor's native pixel format, so it writes the buffer with NO
+//      PNG encode (measured on the RP6: NV12 ~261ms wall vs PNG ~646ms), and
+//      WE never decode a 2 MP PNG -- we read luma/chroma straight out of the
+//      raw planes. This is the fix for Jordi's "1.6 MB per live-sync is too
+//      much": the cost was the PNG encode + the `image` 2 MP decode, both now
+//      gone (the `image` crate dependency was dropped entirely).
+//   2. EDGE-ONLY sampling -- we only touch the outer edge band on each side,
+//      on a bounded grid, which is the correct ambilight source for the
+//      left/right stick LEDs and keeps per-tick CPU trivial.
+//   3. CADENCE -- capture at a slow cadence so even the compositor-side
+//      readback stays a negligible background cost.
+//
+// NV12 layout (measured in Game Mode, 2026-09-20, RP6 gamescope output
+// 1920x1080): the file is the raw GPU buffer. The Y (luma) plane is
+// `width` bytes per row (no per-row padding was observed) for `height` rows;
+// the interleaved U/V (chroma, 2x2-subsampled) plane follows at a
+// PAGE-ALIGNED offset. For 1920x1080: Y = 1920*1080 = 2_073_600 rounded up to
+// a 4096-byte page = 2_076_672; UV = 1920*540 = 1_036_800 rounded up =
+// 1_040_384; total = 3_117_056 bytes (the exact size gamescope writes). The
+// resolution can change (res switch / external display), so the geometry is
+// validated against the actual file size before sampling and, on any
+// mismatch, the caller falls back to the base color (QG-2) rather than
+// sampling garbage -- see `Nv12Layout::resolve` and `capture_screen_split`.
 
-/// screen_sync capture cadence, in seconds. The PRIMARY efficiency knob (see
-/// the module note above): 3s keeps the effect a negligible background cost.
-/// Raise it if physical QA shows any thermal/CPU/battery impact -- the visual
-/// feel of a slower ambilight is a physical-QA call, so this stays a tunable
-/// constant rather than a config field.
+/// screen_sync capture cadence, in seconds. Now that each tick avoids the PNG
+/// encode+decode, the per-tick cost is dominated by the compositor's frame
+/// readback; 3s keeps the effect a negligible background cost. It is now cheap
+/// enough to lower for a snappier ambilight -- the visual feel is a
+/// physical-QA call, so this stays a tunable constant rather than a config
+/// field.
 const SCREEN_SYNC_INTERVAL_SECS: f64 = 3.0;
 
 /// Fraction of the frame width sampled at EACH side for the ambilight
 /// average. gamescope cannot capture a region (see the module note), so the
-/// frame is decoded in full; this only bounds how much of it we read -- the
-/// outer ~8% of each side (approximately the panel border, ~30px on a
-/// ~400px-wide screenshot). Tunable; the feel is a physical-QA call.
+/// full frame is written; this bounds how much of it we *read* -- the outer
+/// ~8% of each side (approximately the panel border, ~154px on a 1920-wide
+/// frame). Tunable; the feel is a physical-QA call.
 const SCREEN_SYNC_EDGE_FRACTION: f64 = 0.08;
+
+/// Default composited output width / height in pixels (gamescope's Game Mode
+/// output on the RP6, measured 2026-09-20). Overridable via
+/// `ARMADA_RGB_SCREEN_WIDTH` / `ARMADA_RGB_SCREEN_HEIGHT` if the resolution
+/// differs on some device/dock, without a rebuild. Only used to interpret the
+/// raw NV12 buffer; a wrong value makes the size check fail -> base-color
+/// fallback, never garbage LEDs.
+const SCREEN_WIDTH_DEFAULT: u32 = 1920;
+const SCREEN_HEIGHT_DEFAULT: u32 = 1080;
+
+/// Byte alignment of each NV12 plane in the buffer gamescope hands back
+/// (page-aligned = 4096 on the RP6). Overridable via
+/// `ARMADA_RGB_NV12_PLANE_ALIGN`. `resolve` also accepts a tightly-packed
+/// buffer, so this only needs to be right for the page-aligned case.
+const NV12_PLANE_ALIGN_DEFAULT: usize = 4096;
 
 /// Hard timeout for a single screenshot capture. Kept comfortably under
 /// `SCREEN_SYNC_INTERVAL_SECS` so a slow capture just delays the next tick
@@ -178,6 +209,12 @@ pub struct EffectState {
     /// directly is not enough on some device, this switches to the session
     /// user without a rebuild.
     screen_sync_user: Option<String>,
+    /// Composited output geometry, used to interpret the raw NV12 capture.
+    /// A wrong value fails the size check in `Nv12Layout::resolve` and falls
+    /// back to the base color rather than sampling garbage.
+    screen_width: u32,
+    screen_height: u32,
+    nv12_plane_align: usize,
     last_left: [u8; 3],
     last_right: [u8; 3],
     screen_sync_warned: bool,
@@ -208,7 +245,9 @@ impl Default for EffectState {
             backlight_ambiguity_warned: false,
             screenshot_path: std::env::var_os("ARMADA_RGB_SCREENSHOT_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/run/armada-rgb/screen-sync.png")),
+                // `.nv12.bin` is what tells gamescope to write the raw NV12
+                // buffer (no PNG encode). tmpfs to avoid wearing flash.
+                .unwrap_or_else(|| PathBuf::from("/run/armada-rgb/screen-sync.nv12.bin")),
             gamescopectl_bin: std::env::var("ARMADA_RGB_GAMESCOPECTL_BIN")
                 .unwrap_or_else(|_| "gamescopectl".into()),
             gamescope_runtime_dir: std::env::var("ARMADA_RGB_GAMESCOPE_XDG_RUNTIME_DIR")
@@ -216,6 +255,13 @@ impl Default for EffectState {
             gamescope_wayland_display: std::env::var("ARMADA_RGB_GAMESCOPE_WAYLAND_DISPLAY")
                 .unwrap_or_else(|_| "gamescope-0".into()),
             screen_sync_user: std::env::var("ARMADA_RGB_SCREEN_SYNC_USER").ok(),
+            screen_width: env_u32("ARMADA_RGB_SCREEN_WIDTH", SCREEN_WIDTH_DEFAULT),
+            screen_height: env_u32("ARMADA_RGB_SCREEN_HEIGHT", SCREEN_HEIGHT_DEFAULT),
+            nv12_plane_align: std::env::var("ARMADA_RGB_NV12_PLANE_ALIGN")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|value| *value >= 1)
+                .unwrap_or(NV12_PLANE_ALIGN_DEFAULT),
             last_left: [0, 0, 0],
             last_right: [0, 0, 0],
             screen_sync_warned: false,
@@ -474,10 +520,164 @@ impl EffectState {
             self.screen_sync_user.as_deref(),
         )?;
 
-        let image = image::open(&self.screenshot_path)
-            .map_err(|error| format!("decode {}: {error}", self.screenshot_path.display()))?
-            .to_rgb8();
-        Ok(average_edges(&image, SCREEN_SYNC_EDGE_FRACTION))
+        // Read the raw NV12 buffer -- no PNG decode. `/run` is tmpfs, so this
+        // read is cheap; the win over the old path is skipping the 2 MP PNG
+        // decode (and the compositor's PNG encode).
+        let raw: Vec<u8> = fs::read(&self.screenshot_path)
+            .map_err(|error| format!("read {}: {error}", self.screenshot_path.display()))?;
+        let layout: Nv12Layout =
+            Nv12Layout::resolve(raw.len(), self.screen_width, self.screen_height, self.nv12_plane_align)
+                .ok_or_else(|| {
+                    format!(
+                        "NV12 size {} does not match {}x{} (plane align {}); set \
+                         ARMADA_RGB_SCREEN_WIDTH/HEIGHT if the output resolution changed",
+                        raw.len(),
+                        self.screen_width,
+                        self.screen_height,
+                        self.nv12_plane_align,
+                    )
+                })?;
+        Ok(average_edges_nv12(&raw, &layout, SCREEN_SYNC_EDGE_FRACTION))
+    }
+
+    /// One instrumented capture for the `screen-sync-probe` diagnostic /
+    /// benchmark. Mirrors [`capture_screen_split`] but times the compositor
+    /// capture and the read+sample separately, and reports the resolved
+    /// geometry and sampled colors, so the effect's cost and correctness can
+    /// be measured on the device without guessing.
+    pub fn probe_screen_sync(&self) -> Result<ScreenSyncProbe, String> {
+        if let Some(parent) = self.screenshot_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        let _ = fs::remove_file(&self.screenshot_path);
+
+        let capture_start: Instant = Instant::now();
+        run_screenshot_command(
+            &self.gamescopectl_bin,
+            &self.screenshot_path,
+            &self.gamescope_runtime_dir,
+            &self.gamescope_wayland_display,
+            self.screen_sync_user.as_deref(),
+        )?;
+        let capture_ms: f64 = capture_start.elapsed().as_secs_f64() * 1000.0;
+
+        let process_start: Instant = Instant::now();
+        let raw: Vec<u8> = fs::read(&self.screenshot_path)
+            .map_err(|error| format!("read {}: {error}", self.screenshot_path.display()))?;
+        let layout: Nv12Layout =
+            Nv12Layout::resolve(raw.len(), self.screen_width, self.screen_height, self.nv12_plane_align)
+                .ok_or_else(|| {
+                    format!(
+                        "NV12 size {} does not match {}x{} (plane align {})",
+                        raw.len(),
+                        self.screen_width,
+                        self.screen_height,
+                        self.nv12_plane_align,
+                    )
+                })?;
+        let (left, right): ([u8; 3], [u8; 3]) =
+            average_edges_nv12(&raw, &layout, SCREEN_SYNC_EDGE_FRACTION);
+        let process_ms: f64 = process_start.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(ScreenSyncProbe {
+            capture_ms,
+            process_ms,
+            bytes: raw.len(),
+            width: layout.width,
+            height: layout.height,
+            uv_offset: layout.uv_offset,
+            left,
+            right,
+        })
+    }
+}
+
+/// Timing + result of a single instrumented `screen_sync` capture, for the
+/// `screen-sync-probe` diagnostic subcommand.
+#[derive(Clone, Copy, Debug)]
+pub struct ScreenSyncProbe {
+    /// Wall time of the compositor capture (`gamescopectl screenshot`), ms.
+    pub capture_ms: f64,
+    /// Wall time to read the raw buffer and sample the edges, ms (no decode).
+    pub process_ms: f64,
+    /// Size of the raw NV12 buffer read.
+    pub bytes: usize,
+    pub width: u32,
+    pub height: u32,
+    pub uv_offset: usize,
+    pub left: [u8; 3],
+    pub right: [u8; 3],
+}
+
+/// Read a `u32` env var, falling back to `default` if unset or unparseable.
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+/// Round `value` up to the next multiple of `align` (`align <= 1` is a no-op).
+fn align_up(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        return value;
+    }
+    // Avoid overflow on the `+ align - 1` for pathological inputs.
+    match value.checked_add(align - 1) {
+        Some(sum) => (sum / align) * align,
+        None => value,
+    }
+}
+
+/// Geometry needed to read edge samples out of a raw NV12 buffer without
+/// decoding it. `stride` is the Y-plane bytes-per-row (== width; no per-row
+/// padding was observed on the RP6), and `uv_offset` is where the interleaved
+/// U/V plane begins. See the module note for the measured 1920x1080 layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Nv12Layout {
+    width: u32,
+    height: u32,
+    stride: usize,
+    uv_offset: usize,
+}
+
+impl Nv12Layout {
+    /// Interpret a raw NV12 buffer of `len` bytes as `width`x`height` with the
+    /// given plane `align`. Returns `None` (caller falls back to the base
+    /// color -- QG-2) unless the length matches one of the plausible packings:
+    /// page-aligned planes (what gamescope hands back on the RP6), page-aligned
+    /// Y with a tight UV tail, or fully tight. This is the guard that keeps a
+    /// resolution change (or a wrong width/height) from making us sample
+    /// garbage instead of admitting the frame is unreadable.
+    fn resolve(len: usize, width: u32, height: u32, align: usize) -> Option<Self> {
+        // NV12 needs even dimensions (2x2 chroma subsampling).
+        if width == 0 || height == 0 || (width & 1) == 1 || (height & 1) == 1 {
+            return None;
+        }
+        let w: usize = width as usize;
+        let h: usize = height as usize;
+        let stride: usize = w; // measured: no per-row padding
+        let y_size: usize = w * h;
+        let uv_size: usize = w * (h / 2); // interleaved: one U and one V per 2x2 block
+        let uv_off_aligned: usize = align_up(y_size, align);
+
+        let total_aligned: usize = uv_off_aligned + align_up(uv_size, align);
+        let total_ypad: usize = uv_off_aligned + uv_size;
+        let total_tight: usize = y_size + uv_size;
+
+        let uv_offset: usize = if len == total_aligned || len == total_ypad {
+            uv_off_aligned
+        } else if len == total_tight {
+            y_size
+        } else {
+            return None;
+        };
+        // Defensive: the sampler must never read past the buffer.
+        if uv_offset.checked_add(uv_size)? > len {
+            return None;
+        }
+        Some(Self { width, height, stride, uv_offset })
     }
 }
 
@@ -622,16 +822,40 @@ fn run_screenshot_command(
         }
     }
 
-    // The compositor writes the file asynchronously; give it a brief moment
-    // to appear rather than failing on the exact same tick the process exits.
-    let flush_deadline: Instant = Instant::now() + Duration::from_millis(500);
-    while !path.exists() {
+    // `gamescopectl screenshot` returns almost immediately; the compositor
+    // then writes (and GROWS) the file asynchronously, after the child has
+    // already exited. Reading as soon as the file merely EXISTS would catch a
+    // half-written buffer (observed: a 2_822_144-byte partial vs the full
+    // 3_117_056) -- harmless for a PNG (decode fails -> fallback) but for a
+    // raw NV12 buffer a short read is just a wrong size. So wait until the
+    // size is non-zero and has STOPPED changing before returning. This is
+    // format-agnostic and bounded by its own deadline.
+    const STABILIZE: Duration = Duration::from_millis(60);
+    let flush_deadline: Instant = Instant::now() + Duration::from_millis(2000);
+    let mut last_size: u64 = 0;
+    let mut stable_since: Option<Instant> = None;
+    loop {
+        match fs::metadata(path).map(|meta| meta.len()) {
+            Ok(size) if size > 0 && size == last_size => {
+                if stable_since.is_some_and(|since| since.elapsed() >= STABILIZE) {
+                    return Ok(());
+                }
+            }
+            Ok(size) if size > 0 => {
+                last_size = size;
+                stable_since = Some(Instant::now());
+            }
+            _ => {}
+        }
         if Instant::now() >= flush_deadline {
-            return Err(format!("{} never appeared", path.display()));
+            return Err(if last_size == 0 {
+                format!("{} never appeared", path.display())
+            } else {
+                format!("{} did not finish writing (stalled at {last_size} bytes)", path.display())
+            });
         }
         sleep(POLL);
     }
-    Ok(())
 }
 
 /// Build the argument passed to `su - <user> -c` that runs the screenshot
@@ -684,16 +908,18 @@ fn kill_process_group(pgid: i32) {
     }
 }
 
-/// Average RGB of the outer LEFT and RIGHT edge bands of the image — the
-/// ambilight source for the left/right stick LEDs. gamescope cannot capture
-/// a region (see the module note), so the full frame is decoded, but only
-/// the outer `edge_fraction` of the width on each side is *read*, on a
-/// bounded grid (never more than ~64 samples per axis) so decoding/sampling
-/// a large screenshot cannot itself become the CPU cost this effect is gated
-/// against. `edge_fraction` is clamped so the two bands never overlap even on
-/// a pathologically narrow frame.
-fn average_edges(image: &image::RgbImage, edge_fraction: f64) -> ([u8; 3], [u8; 3]) {
-    let (width, height): (u32, u32) = image.dimensions();
+/// Average RGB of the outer LEFT and RIGHT edge bands of a raw NV12 buffer —
+/// the ambilight source for the left/right stick LEDs. gamescope cannot
+/// capture a region (see the module note), so the full frame is written, but
+/// only the outer `edge_fraction` of the width on each side is *read*, on a
+/// bounded grid (never more than ~64 samples per axis) so sampling a large
+/// frame cannot itself become the CPU cost this effect is gated against.
+/// `edge_fraction` is clamped so the two bands never overlap even on a
+/// pathologically narrow frame. No PNG decode happens: we read luma from the Y
+/// plane and chroma from the interleaved U/V plane directly.
+fn average_edges_nv12(buf: &[u8], layout: &Nv12Layout, edge_fraction: f64) -> ([u8; 3], [u8; 3]) {
+    let width: u32 = layout.width;
+    let height: u32 = layout.height;
     if width == 0 || height == 0 {
         return ([0, 0, 0], [0, 0, 0]);
     }
@@ -702,31 +928,61 @@ fn average_edges(image: &image::RgbImage, edge_fraction: f64) -> ([u8; 3], [u8; 
     let edge: u32 = ((f64::from(width) * fraction).round() as u32).clamp(1, (width / 2).max(1));
     let step: u32 = (width.max(height) / 64).max(1);
 
-    let left: [u8; 3] = average_band(image, 0, edge, height, step);
-    let right: [u8; 3] = average_band(image, width - edge, width, height, step);
+    let left: [u8; 3] = average_band_nv12(buf, layout, 0, edge, step);
+    let right: [u8; 3] = average_band_nv12(buf, layout, width - edge, width, step);
     (left, right)
 }
 
 /// Average RGB over the columns `[x0, x1)` across the full height, on a grid
-/// of stride `step`. Always takes at least one sample (the band is non-empty
-/// and `height >= 1`).
-fn average_band(image: &image::RgbImage, x0: u32, x1: u32, height: u32, step: u32) -> [u8; 3] {
+/// of stride `step`, reading the raw NV12 planes. For each sampled pixel the
+/// luma comes from `Y[y*stride + x]` and the chroma from the 2x2-subsampled
+/// interleaved plane at `uv_offset + (y/2)*stride + (x/2)*2` (U then V). Any
+/// out-of-range index (only possible under a bad geometry) is skipped, so this
+/// can never panic in the daemon loop.
+fn average_band_nv12(buf: &[u8], layout: &Nv12Layout, x0: u32, x1: u32, step: u32) -> [u8; 3] {
     let mut sum: [u64; 3] = [0; 3];
     let mut n: u64 = 0;
     let mut y: u32 = 0;
-    while y < height {
+    while y < layout.height {
+        let y_row: usize = (y as usize) * layout.stride;
+        let uv_row: usize = layout.uv_offset + (y as usize / 2) * layout.stride;
         let mut x: u32 = x0;
         while x < x1 {
-            let pixel = image.get_pixel(x, y);
-            sum[0] += u64::from(pixel[0]);
-            sum[1] += u64::from(pixel[1]);
-            sum[2] += u64::from(pixel[2]);
-            n += 1;
+            let cx: usize = (x as usize / 2) * 2; // even chroma column, U at cx, V at cx+1
+            if let (Some(&luma), Some(&u), Some(&v)) = (
+                buf.get(y_row + x as usize),
+                buf.get(uv_row + cx),
+                buf.get(uv_row + cx + 1),
+            ) {
+                let [r, g, b]: [u8; 3] = yuv_to_rgb(luma, u, v);
+                sum[0] += u64::from(r);
+                sum[1] += u64::from(g);
+                sum[2] += u64::from(b);
+                n += 1;
+            }
             x += step;
         }
         y += step;
     }
     average(sum, n)
+}
+
+/// Full-range (JPEG/"full swing") BT.601 YUV -> RGB. The exact matrix and
+/// range barely affect an ambient LED color (hue is preserved either way);
+/// full-range BT.601 is the common choice and matches what a desktop-style
+/// screenshot buffer carries. Clamped to `0..=255`.
+fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
+    let yf: f64 = f64::from(y);
+    let uf: f64 = f64::from(u) - 128.0;
+    let vf: f64 = f64::from(v) - 128.0;
+    let r: f64 = yf + 1.402 * vf;
+    let g: f64 = yf - 0.344_136 * uf - 0.714_136 * vf;
+    let b: f64 = yf + 1.772 * uf;
+    [clamp_u8(r), clamp_u8(g), clamp_u8(b)]
+}
+
+fn clamp_u8(value: f64) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
 }
 
 fn average(sum: [u64; 3], n: u64) -> [u8; 3] {
@@ -970,14 +1226,63 @@ mod tests {
         assert!(warning.is_none());
     }
 
-    // -- screen_sync ----------------------------------------------------------
+    // -- NV12 helpers for tests ----------------------------------------------
 
-    fn write_fake_gamescopectl(root: &Path, fixture_png: &Path) -> PathBuf {
+    /// Forward of `yuv_to_rgb` (full-range BT.601 RGB -> YUV) so the test
+    /// fixtures encode a known color that the sampler reads back to ~the same
+    /// RGB (within rounding).
+    fn rgb_to_yuv(rgb: [u8; 3]) -> (u8, u8, u8) {
+        let r: f64 = f64::from(rgb[0]);
+        let g: f64 = f64::from(rgb[1]);
+        let b: f64 = f64::from(rgb[2]);
+        let y: f64 = 0.299 * r + 0.587 * g + 0.114 * b;
+        let u: f64 = -0.168_736 * r - 0.331_264 * g + 0.5 * b + 128.0;
+        let v: f64 = 0.5 * r - 0.418_688 * g - 0.081_312 * b + 128.0;
+        (clamp_u8(y), clamp_u8(u), clamp_u8(v))
+    }
+
+    /// Build a raw NV12 buffer (page-aligned planes, like gamescope's) whose
+    /// per-pixel color is `color_at(x, y)`. `align` sizes each plane's padding.
+    fn make_nv12(
+        width: u32,
+        height: u32,
+        align: usize,
+        color_at: impl Fn(u32, u32) -> [u8; 3],
+    ) -> Vec<u8> {
+        let w: usize = width as usize;
+        let h: usize = height as usize;
+        let y_size: usize = w * h;
+        let uv_size: usize = w * (h / 2);
+        let uv_off: usize = align_up(y_size, align);
+        let total: usize = uv_off + align_up(uv_size, align);
+        let mut buf: Vec<u8> = vec![0u8; total];
+        for y in 0..height {
+            for x in 0..width {
+                let (luma, _, _) = rgb_to_yuv(color_at(x, y));
+                buf[y as usize * w + x as usize] = luma;
+            }
+        }
+        // Chroma sampled from the top-left of each 2x2 block.
+        for cy in 0..(height / 2) {
+            for cx in 0..(width / 2) {
+                let (_, u, v) = rgb_to_yuv(color_at(cx * 2, cy * 2));
+                let off: usize = uv_off + cy as usize * w + cx as usize * 2;
+                buf[off] = u;
+                buf[off + 1] = v;
+            }
+        }
+        buf
+    }
+
+    /// A fake `gamescopectl` that writes a fixed NV12 buffer to `$2` (the path
+    /// arg), so the whole capture path (spawn, poll, read, sample) is exercised
+    /// without a real compositor.
+    fn write_fake_gamescopectl(root: &Path, fixture_nv12: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let script: PathBuf = root.join("fake-gamescopectl.sh");
         fs::write(
             &script,
-            format!("#!/bin/sh\ncp '{}' \"$2\"\n", fixture_png.display()),
+            format!("#!/bin/sh\ncp '{}' \"$2\"\n", fixture_nv12.display()),
         )
         .unwrap();
         let mut permissions = fs::metadata(&script).unwrap().permissions();
@@ -987,36 +1292,73 @@ mod tests {
     }
 
     fn write_split_fixture(root: &Path, left: [u8; 3], right: [u8; 3]) -> PathBuf {
-        let path: PathBuf = root.join("fixture.png");
-        let mut fixture = image::RgbImage::new(4, 4);
-        for y in 0..4 {
-            for x in 0..4 {
-                let color = if x < 2 { left } else { right };
-                fixture.put_pixel(x, y, image::Rgb(color));
-            }
-        }
-        fixture.save(&path).unwrap();
+        let path: PathBuf = root.join("fixture.nv12.bin");
+        let buf: Vec<u8> = make_nv12(8, 4, 64, |x, _| if x < 4 { left } else { right });
+        fs::write(&path, &buf).unwrap();
         path
     }
+
+    fn approx(actual: [u8; 3], expected: [u8; 3], label: &str) {
+        for i in 0..3 {
+            let diff: i32 = i32::from(actual[i]) - i32::from(expected[i]);
+            assert!(
+                diff.abs() <= 4,
+                "{label}: channel {i} {} not ~= {} (YUV round-trip)",
+                actual[i],
+                expected[i]
+            );
+        }
+    }
+
+    // -- Nv12Layout::resolve --------------------------------------------------
+
+    #[test]
+    fn nv12_layout_matches_the_measured_rp6_geometry() {
+        // Game Mode, 2026-09-20: gamescope wrote exactly 3_117_056 bytes for a
+        // 1920x1080 output with 4096-byte page-aligned planes.
+        let layout = Nv12Layout::resolve(3_117_056, 1920, 1080, 4096)
+            .expect("the measured RP6 size must be accepted");
+        assert_eq!(layout.width, 1920);
+        assert_eq!(layout.height, 1080);
+        assert_eq!(layout.stride, 1920, "no per-row padding was observed");
+        assert_eq!(layout.uv_offset, 2_076_672, "UV plane starts at align_up(1920*1080, 4096)");
+    }
+
+    #[test]
+    fn nv12_layout_accepts_tightly_packed_and_rejects_wrong_size() {
+        // Tightly packed (no plane padding): align 1 => uv right after Y.
+        let tight = Nv12Layout::resolve(1920 * 1080 * 3 / 2, 1920, 1080, 4096).unwrap();
+        assert_eq!(tight.uv_offset, 1920 * 1080);
+        // A size that matches no packing (a resolution change) is rejected so
+        // the caller falls back to base instead of sampling garbage (QG-2).
+        assert!(Nv12Layout::resolve(1_234_567, 1920, 1080, 4096).is_none());
+        // Odd dimensions are not valid NV12.
+        assert!(Nv12Layout::resolve(100, 11, 10, 64).is_none());
+    }
+
+    // -- screen_sync ----------------------------------------------------------
 
     #[test]
     fn screen_sync_averages_left_and_right_halves() {
         let root: PathBuf = fixture_dir("screen-sync-ok");
-        let fixture_png: PathBuf = write_split_fixture(&root, [255, 0, 0], [0, 0, 255]);
-        let script: PathBuf = write_fake_gamescopectl(&root, &fixture_png);
+        let fixture: PathBuf = write_split_fixture(&root, [255, 0, 0], [0, 0, 255]);
+        let script: PathBuf = write_fake_gamescopectl(&root, &fixture);
 
         let mut state: EffectState = EffectState {
             gamescopectl_bin: script.to_string_lossy().into_owned(),
-            screenshot_path: root.join("out.png"),
+            screenshot_path: root.join("out.nv12.bin"),
             screen_sync_user: None,
+            screen_width: 8,
+            screen_height: 4,
+            nv12_plane_align: 64,
             ..EffectState::default()
         };
         let (frame, _brightness) = state.render(Effect::ScreenSync, [0, 0, 0], 100, 100, 0.0, 8);
         match frame {
             Frame::PerTarget(colors) => {
                 assert_eq!(colors.len(), 8);
-                assert_eq!(colors[0], [255, 0, 0], "left ring should follow the left half");
-                assert_eq!(colors[7], [0, 0, 255], "right ring should follow the right half");
+                approx(colors[0], [255, 0, 0], "left ring should follow the left half");
+                approx(colors[7], [0, 0, 255], "right ring should follow the right half");
             }
             other => panic!("screen_sync must be per-target, got {other:?}"),
         }
@@ -1025,13 +1367,16 @@ mod tests {
     #[test]
     fn screen_sync_falls_back_to_last_colors_then_recovers() {
         let root: PathBuf = fixture_dir("screen-sync-fallback");
-        let fixture_png: PathBuf = write_split_fixture(&root, [10, 20, 30], [40, 50, 60]);
-        let script: PathBuf = write_fake_gamescopectl(&root, &fixture_png);
+        let fixture: PathBuf = write_split_fixture(&root, [10, 20, 30], [40, 50, 60]);
+        let script: PathBuf = write_fake_gamescopectl(&root, &fixture);
 
         let mut state: EffectState = EffectState {
             gamescopectl_bin: root.join("does-not-exist").to_string_lossy().into_owned(),
-            screenshot_path: root.join("out.png"),
+            screenshot_path: root.join("out.nv12.bin"),
             screen_sync_user: None,
+            screen_width: 8,
+            screen_height: 4,
+            nv12_plane_align: 64,
             ..EffectState::default()
         };
         let (frame, _) = state.render(Effect::ScreenSync, [0, 0, 0], 100, 100, 0.0, 4);
@@ -1043,61 +1388,94 @@ mod tests {
 
         state.gamescopectl_bin = script.to_string_lossy().into_owned();
         let (frame, _) = state.render(Effect::ScreenSync, [0, 0, 0], 100, 100, 0.0, 4);
-        assert_eq!(frame.expand(4), vec![[10, 20, 30], [10, 20, 30], [40, 50, 60], [40, 50, 60]]);
+        let colors: Vec<[u8; 3]> = frame.expand(4);
+        approx(colors[0], [10, 20, 30], "left recovered");
+        approx(colors[1], [10, 20, 30], "left recovered");
+        approx(colors[2], [40, 50, 60], "right recovered");
+        approx(colors[3], [40, 50, 60], "right recovered");
+    }
+
+    #[test]
+    fn screen_sync_falls_back_to_base_when_size_mismatches() {
+        // A buffer whose length matches no packing for the configured geometry
+        // (as if the resolution changed) must NOT paint garbage: QG-2 falls
+        // back to the base color.
+        let root: PathBuf = fixture_dir("screen-sync-size-mismatch");
+        let fixture: PathBuf = root.join("fixture.nv12.bin");
+        fs::write(&fixture, vec![200u8; 4096]).unwrap(); // wrong size for 8x4
+        let script: PathBuf = write_fake_gamescopectl(&root, &fixture);
+        let mut state: EffectState = EffectState {
+            gamescopectl_bin: script.to_string_lossy().into_owned(),
+            screenshot_path: root.join("out.nv12.bin"),
+            screen_sync_user: None,
+            screen_width: 8,
+            screen_height: 4,
+            nv12_plane_align: 64,
+            ..EffectState::default()
+        };
+        let base: [u8; 3] = [7, 8, 9];
+        let (frame, _) = state.render(Effect::ScreenSync, base, 100, 100, 0.0, 4);
+        assert_eq!(frame.expand(4), vec![base; 4], "size mismatch must fall back to base, not garbage");
     }
 
     // -- efficient edge sampling (armada#27) ---------------------------------
 
-    /// Build a WxH image with distinct left-edge / center / right-edge colors.
-    fn banded_image(
+    /// Build a WxH NV12 buffer with distinct left-edge / center / right-edge colors.
+    fn banded_nv12(
         width: u32,
         height: u32,
         edge: u32,
         left: [u8; 3],
         center: [u8; 3],
         right: [u8; 3],
-    ) -> image::RgbImage {
-        let mut img = image::RgbImage::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                let color = if x < edge {
-                    left
-                } else if x >= width - edge {
-                    right
-                } else {
-                    center
-                };
-                img.put_pixel(x, y, image::Rgb(color));
+    ) -> (Vec<u8>, Nv12Layout) {
+        let buf: Vec<u8> = make_nv12(width, height, 64, |x, _| {
+            if x < edge {
+                left
+            } else if x >= width - edge {
+                right
+            } else {
+                center
             }
-        }
-        img
+        });
+        let layout: Nv12Layout = Nv12Layout::resolve(buf.len(), width, height, 64).unwrap();
+        (buf, layout)
     }
 
     #[test]
     fn average_edges_reads_only_the_borders_not_the_center() {
         // A wide frame whose center is a loud color the ambilight must ignore.
-        let img = banded_image(10, 4, 2, [255, 0, 0], [0, 255, 0], [0, 0, 255]);
-        let (left, right) = average_edges(&img, 0.2); // 0.2 * 10 = 2 cols per side
-        assert_eq!(left, [255, 0, 0], "left ring follows the left border, not the green center");
-        assert_eq!(right, [0, 0, 255], "right ring follows the right border, not the green center");
+        let (buf, layout) = banded_nv12(10, 4, 2, [255, 0, 0], [0, 255, 0], [0, 0, 255]);
+        let (left, right) = average_edges_nv12(&buf, &layout, 0.2); // 0.2 * 10 = 2 cols per side
+        approx(left, [255, 0, 0], "left ring follows the left border, not the green center");
+        approx(right, [0, 0, 255], "right ring follows the right border, not the green center");
     }
 
     #[test]
     fn average_edges_always_samples_at_least_one_column_per_side() {
         // Fraction rounds to zero, but each side must still yield a sample.
-        let img = banded_image(20, 3, 1, [10, 10, 10], [99, 99, 99], [20, 20, 20]);
-        let (left, right) = average_edges(&img, 0.0);
-        assert_eq!(left, [10, 10, 10]);
-        assert_eq!(right, [20, 20, 20]);
+        let (buf, layout) = banded_nv12(20, 4, 2, [10, 10, 10], [99, 99, 99], [20, 20, 20]);
+        let (left, right) = average_edges_nv12(&buf, &layout, 0.0);
+        approx(left, [10, 10, 10], "left");
+        approx(right, [20, 20, 20], "right");
     }
 
     #[test]
-    fn average_edges_does_not_panic_on_a_one_pixel_frame() {
-        let mut img = image::RgbImage::new(1, 1);
-        img.put_pixel(0, 0, image::Rgb([7, 8, 9]));
-        let (left, right) = average_edges(&img, 0.08);
-        assert_eq!(left, [7, 8, 9]);
-        assert_eq!(right, [7, 8, 9]);
+    fn average_edges_does_not_panic_on_a_two_pixel_frame() {
+        // Smallest valid NV12 (even dims). A bad geometry can't panic either:
+        // out-of-range samples are skipped.
+        let (buf, layout) = banded_nv12(2, 2, 1, [7, 8, 9], [7, 8, 9], [7, 8, 9]);
+        let (left, right) = average_edges_nv12(&buf, &layout, 0.08);
+        approx(left, [7, 8, 9], "left");
+        approx(right, [7, 8, 9], "right");
+    }
+
+    #[test]
+    fn yuv_to_rgb_round_trips_primaries() {
+        for color in [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255], [0, 0, 0]] {
+            let (y, u, v) = rgb_to_yuv(color);
+            approx(yuv_to_rgb(y, u, v), color, "primary round-trip");
+        }
     }
 
     // -- su -c shell quoting (B1) --------------------------------------------

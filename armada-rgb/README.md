@@ -93,12 +93,26 @@ picked, rather than staying silent about it.
 ### `screen_sync`
 
 Captures the screen with `gamescopectl screenshot <path>` and paints the
-average color of the left half of the screen to the left-side targets and the
-right half to the right-side targets (the first half of the profile's target
-list is treated as "left", the rest as "right"). Sampling is on a bounded
-grid (at most ~64 samples per axis) and gated to a slow, fixed 3-second cadence
-— capturing and decoding a screenshot is real CPU/IO work, unlike a sysfs
-read, and this keeps it from becoming a background thermal/CPU drain.
+average color of the left EDGE band of the screen to the left-side targets and
+the right edge band to the right-side targets (the first half of the profile's
+target list is treated as "left", the rest as "right"). The capture is a **raw
+NV12 buffer** (`<path>.nv12.bin`): the extension tells gamescope to write its
+native pixel format with no PNG encode, and the daemon reads luma/chroma
+straight out of the raw Y and interleaved U/V planes — no image decode. This is
+the efficiency fix (armada#27): the old path wrote a PNG (compositor-side
+encode) and decoded the whole ~2 MP frame just to average a few edge columns.
+Measured on the RP6 (Game Mode, 1920×1080): NV12 capture ~261 ms wall vs PNG
+~646 ms, and the 2 MP PNG decode is gone entirely (the `image` crate dependency
+was dropped). Sampling is still on a bounded grid (at most ~64 samples per axis)
+of only the outer edge band, and gated to a slow, fixed 3-second cadence so
+even the compositor-side readback stays a negligible background cost.
+
+The NV12 geometry is validated against the actual file size before sampling; if
+it does not match the configured output resolution (e.g. a resolution change or
+external display), the effect falls back to the base color rather than sampling
+garbage. Defaults are 1920×1080 with 4096-byte page-aligned planes (the RP6's
+Game Mode output); override with `ARMADA_RGB_SCREEN_WIDTH` /
+`ARMADA_RGB_SCREEN_HEIGHT` / `ARMADA_RGB_NV12_PLANE_ALIGN` if a device differs.
 
 `armada-rgb run` is a system service with no graphical session environment of
 its own, so it never inherits `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY` — this
@@ -110,16 +124,18 @@ Wayland socket on some device, set `ARMADA_RGB_SCREEN_SYNC_USER` to run the
 capture through `su - <user> -c '...'` instead (e.g. the session user, so it
 runs with that user's environment rather than root's). `gamescopectl` itself
 is resolved via `ARMADA_RGB_GAMESCOPECTL_BIN` (default: `gamescopectl` on
-`PATH`) and the captured PNG is written to `ARMADA_RGB_SCREENSHOT_PATH`
-(default: `/run/armada-rgb/screen-sync.png`, tmpfs, to avoid wearing flash
-storage with a capture every few seconds). A capture is bounded by a hard
+`PATH`) and the captured NV12 buffer is written to `ARMADA_RGB_SCREENSHOT_PATH`
+(default: `/run/armada-rgb/screen-sync.nv12.bin`, tmpfs, to avoid wearing flash
+storage with a capture every few seconds — the `.nv12.bin` extension is what
+selects the raw format). A capture is bounded by a hard
 2.5-second timeout (comfortably under the 3s cadence above, so a slow capture
 under load just delays the next tick instead of the two ever overlapping) —
 a wedged compositor is killed and reaped, never left running or awaited
 indefinitely, so this can never hang the daemon past that timeout either way.
-On any failure (no graphical session yet, timeout, decode error) the effect
-logs a one-time diagnostic and keeps showing the last successfully sampled
-colors (black before the first successful capture) instead of flickering.
+On any failure (no graphical session yet, timeout, unreadable/size-mismatched
+buffer) the effect logs a one-time diagnostic and keeps showing the last
+successfully sampled colors (black before the first successful capture)
+instead of flickering.
 
 ## Charging indicator (deep-sleep, kernel-triggered)
 
@@ -150,5 +166,6 @@ honors `ARMADA_RGB_CONFIG_PATH`, `ARMADA_RGB_SYSFS_ROOT`,
 source), `ARMADA_RGB_BACKLIGHT_ROOT` / `ARMADA_RGB_BACKLIGHT_NAME` (screen
 backlight source), and `ARMADA_RGB_SCREENSHOT_PATH` /
 `ARMADA_RGB_GAMESCOPECTL_BIN` / `ARMADA_RGB_GAMESCOPE_XDG_RUNTIME_DIR` /
-`ARMADA_RGB_GAMESCOPE_WAYLAND_DISPLAY` / `ARMADA_RGB_SCREEN_SYNC_USER`
-(screen capture).
+`ARMADA_RGB_GAMESCOPE_WAYLAND_DISPLAY` / `ARMADA_RGB_SCREEN_SYNC_USER` /
+`ARMADA_RGB_SCREEN_WIDTH` / `ARMADA_RGB_SCREEN_HEIGHT` /
+`ARMADA_RGB_NV12_PLANE_ALIGN` (screen capture).
