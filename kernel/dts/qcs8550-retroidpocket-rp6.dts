@@ -210,6 +210,16 @@
 		#size-cells = <0>;
 		sdb-gpios = <&tlmm 55 GPIO_ACTIVE_HIGH>;
 		vdd-supply = <&vdd_mcu_3v3>;
+		/*
+		 * Do NOT let the LED core blank these on system suspend: the
+		 * driver only sets LED_CORE_SUSPENDRESUME when "always-on" is
+		 * absent, and that core-blank zeroes brightness on suspend
+		 * entry -- which defeats the keep_alive charge indicator (the
+		 * chip stays powered but the pattern is wiped: "green ~0.5s
+		 * then dark"). vdd_mcu_3v3 is regulator-always-on, so the chip
+		 * retains its PWM across deep suspend when keep_alive is set.
+		 */
+		always-on;
 
 		ledl_b1: led@1 {
 			reg = <1>;
@@ -282,6 +292,10 @@
 		#size-cells = <0>;
 		sdb-gpios = <&tlmm 56 GPIO_ACTIVE_HIGH>;
 		vdd-supply = <&vdd_mcu_3v3>;
+		/* See htr3212l above: keep the LED core from blanking the PWM
+		 * pattern on suspend so the keep_alive charge indicator survives
+		 * deep sleep instead of flashing for ~0.5s and going dark. */
+		always-on;
 
 		ledr_b1: led@1 {
 			reg = <1>;
