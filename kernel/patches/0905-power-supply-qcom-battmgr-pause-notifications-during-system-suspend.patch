@@ -1,0 +1,183 @@
+From: unjordi <jordi@ciencias.unam.mx>
+Subject: [PATCH] power: supply: qcom_battmgr: pause firmware notifications
+ during system suspend on battery
+
+On SM8550 the ADSP keeps pushing routine battery notifications
+(BATTMGR_NOTIFICATION, NOTIF_BAT_STATUS) while the system sleeps. The
+glink-smem doorbell that carries them is an IRQF_NO_SUSPEND interrupt
+routed straight to the GIC, which stays powered in s2ram on this SoC
+(CX never collapses), so each of them pulls the AP out of suspend
+without an attributable wakeup IRQ (pm_wakeup_irq empty).
+
+On a Retroid Pocket 6 this showed up as the device waking up on its own
+every few minutes on battery: 56 spontaneous resumes in two days (52 on
+battery), median 6.8 minutes asleep. ftrace (boot clock, kprobes on
+qcom_ipcc_irq_fn and pmic_glink_rpmsg_callback) shows the very first
+thing to run after resume is ipcc_0 -> glink-smem -> PMIC_RTR_ADSP_APPS
+-> owner BATTMGR, NOTIFY, opcode 0x7, NOTIF_BAT_STATUS.
+
+Ask the firmware to stop notifying while the system is suspended, using
+the same request the downstream driver sends when the panel blanks
+(BC_DISABLE_NOTIFY_REQ, 0x5, same layout as the enable request), and
+re-request notifications on resume, refreshing the supplies so userspace
+re-reads anything that changed in the meantime.
+
+This is restricted to the SM8550 variant, where it was measured, and to
+running on battery: with a charger attached (or if the online state
+cannot be confirmed) nothing changes, so the charge path and the
+attach/detach wakeups of the previous patch are untouched. A failure to
+pause only logs a warning and never blocks suspend.
+
+---
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index c7fce56..892deb2 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -16,6 +16,7 @@
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include <linux/math.h>
+ #include <linux/units.h>
++#include <linux/pm.h>
+ 
+ #define BATTMGR_CHEMISTRY_LEN	4
+ #define BATTMGR_STRING_LEN	128
+@@ -30,6 +31,7 @@ enum qcom_battmgr_variant {
+ #define BATTMGR_BAT_STATUS		0x1
+ 
+ #define BATTMGR_REQUEST_NOTIFICATION	0x4
++#define BATTMGR_DISABLE_NOTIFICATION	0x5
+ 
+ #define BATTMGR_NOTIFICATION		0x7
+ #define NOTIF_BAT_PROPERTY		0x30
+@@ -336,6 +338,8 @@ struct qcom_battmgr {
+ 	struct completion ack;
+ 
+ 	bool service_up;
++	/* notifications were stopped by system suspend and must be re-requested */
++	bool notifications_quiesced;
+ 
+ 	struct qcom_battmgr_info info;
+ 	struct qcom_battmgr_status status;
+@@ -1442,6 +1446,7 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
+ 
+ 	switch (opcode) {
+ 	case BATTMGR_REQUEST_NOTIFICATION:
++	case BATTMGR_DISABLE_NOTIFICATION:
+ 		battmgr->error = 0;
+ 		break;
+ 	case BATTMGR_BAT_INFO:
+@@ -1734,6 +1739,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 		}
+ 		break;
+ 	case BATTMGR_REQUEST_NOTIFICATION:
++	case BATTMGR_DISABLE_NOTIFICATION:
+ 	case BATTMGR_CHG_CTRL_LIMIT_EN:
+ 		battmgr->error = 0;
+ 		break;
+@@ -1776,6 +1782,88 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
+ }
+ 
++/*
++ * While the system sleeps the ADSP keeps pushing routine battery
++ * notifications (BATTMGR_NOTIFICATION / NOTIF_BAT_STATUS). On SM8550 the
++ * glink-smem doorbell is an IRQF_NO_SUSPEND interrupt routed straight to
++ * the GIC, which stays powered in s2ram, so every one of them pulls the
++ * AP out of suspend with no attributable wakeup IRQ, every few minutes.
++ * Ask the firmware to stop notifying for the duration of system sleep
++ * (the same request the downstream driver sends when the panel blanks)
++ * and re-request notifications on resume. This is only done on battery:
++ * with a charger attached nothing changes. Plugging a charger in while
++ * suspended is expected to still reach the AP through ucsi_glink (a separate
++ * pmic_glink client that keeps notifying).
++ */
++static int qcom_battmgr_set_notifications(struct qcom_battmgr *battmgr, bool enable)
++{
++	struct qcom_battmgr_enable_request req = {
++		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
++		.hdr.type = cpu_to_le32(PMIC_GLINK_NOTIFY),
++		.hdr.opcode = cpu_to_le32(enable ? BATTMGR_REQUEST_NOTIFICATION :
++						   BATTMGR_DISABLE_NOTIFICATION),
++	};
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++
++static int qcom_battmgr_suspend(struct device *dev)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++	int ret;
++
++	if (battmgr->variant != QCOM_BATTMGR_SM8550 || !battmgr->service_up)
++		return 0;
++
++	/*
++	 * Only on battery. With a charger attached the AP has to keep
++	 * hearing from the firmware (charge-start servicing, attach/detach
++	 * wakeups from the online works), so leave that path untouched; if
++	 * the state cannot be confirmed, don't pause either.
++	 */
++	if (qcom_battmgr_usb_sm8350_update(battmgr, POWER_SUPPLY_PROP_ONLINE) ||
++	    qcom_battmgr_wls_sm8350_update(battmgr, POWER_SUPPLY_PROP_ONLINE) ||
++	    battmgr->usb.online || battmgr->wireless.online)
++		return 0;
++
++	ret = qcom_battmgr_set_notifications(battmgr, false);
++	if (ret) {
++		/* never block system suspend over this; just keep the old behaviour */
++		dev_warn(dev, "failed to pause notifications for suspend: %d\n", ret);
++		return 0;
++	}
++	battmgr->notifications_quiesced = true;
++
++	return 0;
++}
++
++static int qcom_battmgr_resume(struct device *dev)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
++
++	if (!battmgr->notifications_quiesced)
++		return 0;
++	battmgr->notifications_quiesced = false;
++
++	/* re-arm notifications and let userspace re-read what changed meanwhile */
++	schedule_work(&battmgr->enable_work);
++	if (battmgr->bat_psy)
++		power_supply_changed(battmgr->bat_psy);
++	if (battmgr->usb_psy)
++		power_supply_changed(battmgr->usb_psy);
++	if (battmgr->wls_psy)
++		power_supply_changed(battmgr->wls_psy);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(qcom_battmgr_pm_ops, qcom_battmgr_suspend, qcom_battmgr_resume);
++
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ {
+ 	struct qcom_battmgr *battmgr = priv;
+@@ -1817,6 +1905,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 		return -ENOMEM;
+ 
+ 	battmgr->dev = dev;
++	auxiliary_set_drvdata(adev, battmgr);
+ 
+ 	psy_cfg.drv_data = battmgr;
+ 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
+@@ -1956,6 +2045,9 @@ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.name = "pmic_glink_power_supply",
+ 	.probe = qcom_battmgr_probe,
+ 	.id_table = qcom_battmgr_id_table,
++	.driver = {
++		.pm = pm_sleep_ptr(&qcom_battmgr_pm_ops),
++	},
+ };
+ 
+ module_auxiliary_driver(qcom_battmgr_driver);
