@@ -46,3 +46,11 @@ to a commit, or `armada` if it's original; a URL source with no `notes` is verba
   source: armada
 - `patches/0021-libliftoff-fix-multiple-primary-plane-stacking.patch`
   source: armada
+- `patches/0022-screenshot-thread-sched-other-not-rt.patch`
+  source: armada
+  notes: The screenshot thread (gamescope-scrsh) inherits the compositor's
+  SCHED_RR policy. With an RLIMIT_RTTIME budget (200 ms on the Retroid Pocket 6,
+  traced with ftrace to posix_cpu_timers_work), encoding a PNG of a game frame on
+  ARM overruns it and the kernel SIGKILLs the whole compositor, ending the game
+  session. The thread now drops to SCHED_OTHER as soon as it starts; the
+  compositor thread stays realtime.

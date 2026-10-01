@@ -1,0 +1,36 @@
+From: Jordi Serra <jordi@ciencias.unam.mx>
+Subject: [PATCH] steamcompmgr: run the screenshot thread as SCHED_OTHER
+
+The screenshot worker is created from the compositor thread, which runs
+SCHED_RR, so it inherits the realtime policy. When the process has an
+RLIMIT_RTTIME budget (200 ms measured on the Retroid Pocket 6), encoding
+a full-resolution PNG on a slower ARM CPU can exceed it, and the kernel's
+posix CPU timer then sends SIGKILL to the whole compositor: taking a
+screenshot ends the game session.
+
+Encoding is not latency critical. Drop the thread to SCHED_OTHER as soon
+as it starts so its CPU time no longer counts against the realtime
+budget. The compositor thread keeps its realtime policy.
+---
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 2e0896f..b52e631 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -3333,6 +3333,17 @@ paint_all( global_focus_t *pFocus, bool async )
+ 			std::thread screenshotThread = std::thread([=] {
+ 				pthread_setname_np( pthread_self(), "gamescope-scrsh" );
+ 
++				// This thread inherits the compositor's realtime policy (SCHED_RR).
++				// Encoding a full-resolution frame can take longer than the
++				// process's RLIMIT_RTTIME budget on slower CPUs, and the kernel
++				// then SIGKILLs the whole compositor. Encoding is not latency
++				// critical, so run it as a normal thread.
++				struct sched_param schedParam{};
++				schedParam.sched_priority = 0;
++				int nSchedRet = pthread_setschedparam( pthread_self(), SCHED_OTHER, &schedParam );
++				if ( nSchedRet != 0 )
++					xwm_log.errorf( "Failed to drop screenshot thread to SCHED_OTHER: %s", strerror( nSchedRet ) );
++
+ 				const uint8_t *mappedData = pScreenshotTexture->mappedData();
+ 				const uint32_t width = pScreenshotTexture->width();
+ 				const uint32_t height = pScreenshotTexture->height();
