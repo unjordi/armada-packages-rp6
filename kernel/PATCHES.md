@@ -432,6 +432,17 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   telemetry doorbell for current to keep flowing -- the physical QA at mid-SOC
   (current_now > 0 in deep, post-fix, no more spontaneous multi-second wakes while
   charging) is what confirms or refutes that assumption.
+- `patches/0905-power-supply-qcom-battmgr-pause-notifications-during-system-suspend.patch`
+  source: armada (unjordi)
+  upstream: not submitted (candidate; mirrors downstream qti_battery_charger BC_DISABLE_NOTIFY_REQ)
+  notes: QG-8-b. On battery the RP6 woke from deep on its own every few minutes (56 resumes in
+  2 days, median 6.8 min, wake_irq=none). ftrace named the waker: ipcc_0 -> glink-smem ->
+  PMIC_RTR_ADSP_APPS -> BATTMGR NOTIFY opcode 0x7 NOTIF_BAT_STATUS (the doorbell is
+  IRQF_NO_SUSPEND straight to the GIC, which stays up because CX never collapses). Sends
+  BATTMGR_DISABLE_NOTIFICATION (0x5) in .suspend and re-requests notifications in .resume.
+  SM8550 variant only, and only on battery (charger online or unknown -> no change), so the
+  0903/0904 charge path is untouched; a failed request only warns and never blocks suspend.
+  Does NOT touch the transport (no 0504-style mask, no NO_SUSPEND removal).
 - `patches/0001-pcie-update-sm8650-dtsi.patch`
   source: https://github.com/ROCKNIX/distribution/blob/bcf3b5bc574990b96543484575b06f912153a715/projects/ROCKNIX/devices/SM8650/patches/linux/0001-pcie-update-sm8650-dtsi.patch
   upstream: https://lore.kernel.org/r/20260611-wake-v2-35-2744251b1181@oss.qualcomm.com
