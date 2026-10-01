@@ -223,6 +223,11 @@ pub struct EffectState {
     screen_width: u32,
     screen_height: u32,
     nv12_plane_align: usize,
+    /// LED-vs-screen brightness factor applied by `scale_for_sync` (QG-5:
+    /// the LEDs read brighter than the panel at the same backlight level).
+    /// HW-dependent, so it comes from the device env `ARMADA_RGB_SYNC_SCALE`;
+    /// see `device_sync_scale`.
+    sync_scale: f64,
     last_left: [u8; 3],
     last_right: [u8; 3],
     screen_sync_warned: bool,
@@ -265,6 +270,7 @@ impl Default for EffectState {
             screen_sync_user: std::env::var("ARMADA_RGB_SCREEN_SYNC_USER").ok(),
             screen_width: env_u32("ARMADA_RGB_SCREEN_WIDTH", SCREEN_WIDTH_DEFAULT),
             screen_height: env_u32("ARMADA_RGB_SCREEN_HEIGHT", SCREEN_HEIGHT_DEFAULT),
+            sync_scale: device_sync_scale(),
             nv12_plane_align: std::env::var("ARMADA_RGB_NV12_PLANE_ALIGN")
                 .ok()
                 .and_then(|value| value.trim().parse::<usize>().ok())
@@ -417,10 +423,11 @@ impl EffectState {
             return brightness;
         }
         let pct: f64 = self.sample_backlight_pct();
-        // QG-5: the LED panel reads ~12% brighter than the screen panel at
-        // the same backlight percentage, so scale the LED brightness down by
-        // 12% (×0.88) to match the perceived screen brightness.
-        (f64::from(brightness) * pct * 0.88).round().min(100.0) as u8
+        // QG-5: the LED panel reads brighter than the screen panel at the same
+        // backlight percentage, so scale the LED brightness by the
+        // device-specific `sync_scale` factor (from `ARMADA_RGB_SYNC_SCALE`,
+        // e.g. 0.88 on the RP6) to match the perceived screen brightness.
+        (f64::from(brightness) * pct * self.sync_scale).round().min(100.0) as u8
     }
 
     /// Screen backlight as a `0.0..=1.0` fraction. Falls back to `1.0`
@@ -624,6 +631,75 @@ fn env_u32(key: &str, default: u32) -> u32 {
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
         .unwrap_or(default)
+}
+
+/// Default path of the OS helper that prints the resolved device env
+/// (`KEY=value` lines). Overridable with `ARMADA_DEVICE_ENV`, the same knob the
+/// other Armada services (armada-powerd, armada-control) honor.
+const DEVICE_ENV_HELPER: &str = "/usr/libexec/armada/device-env";
+
+/// The LED-vs-screen brightness factor used by `scale_for_sync` when the
+/// device does not declare one: no compensation.
+const SYNC_SCALE_DEFAULT: f64 = 1.0;
+
+/// Look up `key` in the device env. An explicit process env var wins (lets a
+/// unit file or a test override it); otherwise the OS device-env helper is
+/// run and its output searched. `None` when the key is absent or empty, or
+/// the helper is missing (non-Armada host) or fails.
+fn device_env_value(key: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(key) {
+        return Some(value).filter(|value| !value.trim().is_empty());
+    }
+    let helper: String =
+        std::env::var("ARMADA_DEVICE_ENV").unwrap_or_else(|_| DEVICE_ENV_HELPER.into());
+    let output: std::process::Output = Command::new(helper)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_device_env(&String::from_utf8_lossy(&output.stdout), key)
+}
+
+/// Find `key` in device-env output. The helper prints `KEY=%q`, so a plain
+/// value is bare and an empty one is `''`; single quotes are stripped.
+fn parse_device_env(output: &str, key: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let value: &str = line.strip_prefix(key)?.strip_prefix('=')?;
+        let value: &str = value
+            .strip_prefix('\'')
+            .and_then(|inner| inner.strip_suffix('\''))
+            .unwrap_or(value);
+        Some(value.to_string()).filter(|value| !value.trim().is_empty())
+    })
+}
+
+/// LED-vs-screen brightness factor (QG-5) from the device env key
+/// `ARMADA_RGB_SYNC_SCALE` (the device `.conf` sets it, e.g. `0.88` on the
+/// RP6). Absent → `1.0`.
+fn device_sync_scale() -> f64 {
+    device_env_value("ARMADA_RGB_SYNC_SCALE")
+        .map(|raw| parse_sync_scale(&raw))
+        .unwrap_or(SYNC_SCALE_DEFAULT)
+}
+
+/// Validate an `ARMADA_RGB_SYNC_SCALE` value: a number in `(0, 2]` is used
+/// as-is; anything else falls back to `1.0` with an `[armada-rgb]` warning so
+/// a misconfigured device is visible instead of silently wrong.
+fn parse_sync_scale(raw: &str) -> f64 {
+    match raw.trim().parse::<f64>() {
+        Ok(value) if value > 0.0 && value <= 2.0 => value,
+        _ => {
+            eprintln!(
+                "[armada-rgb] ARMADA_RGB_SYNC_SCALE={:?} is not a number in (0, 2]; \
+                 using {SYNC_SCALE_DEFAULT} (no LED-vs-screen compensation)",
+                raw.trim()
+            );
+            SYNC_SCALE_DEFAULT
+        }
+    }
 }
 
 /// Round `value` up to the next multiple of `align` (`align <= 1` is a no-op).
@@ -1131,12 +1207,65 @@ mod tests {
         let mut state: EffectState = EffectState {
             backlight_root: root,
             backlight_name: None,
+            sync_scale: 0.88, // the RP6 device-env value
             ..EffectState::default()
         };
         // Same math whether the 80 came from a plain static config or from an
         // effect's own computed brightness (e.g. mid-breath) — scale_for_sync
         // does not know or care which.
         assert_eq!(state.scale_for_sync(80, true), 35); // 80 ceiling * 50% backlight * 0.88 (QG-5)
+    }
+
+    #[test]
+    fn scale_for_sync_is_unscaled_when_factor_is_default() {
+        // No device key -> default factor 1.0 -> the brightness is scaled only
+        // by the live backlight percentage, with no LED-vs-screen compensation.
+        let root: PathBuf = fixture_dir("sync-default-factor");
+        backlight_device(&root, "panel.dsi.0", 50, 100);
+
+        let mut state: EffectState = EffectState {
+            backlight_root: root,
+            backlight_name: None,
+            sync_scale: 1.0,
+            ..EffectState::default()
+        };
+        assert_eq!(state.scale_for_sync(80, true), 40); // 80 * 50% * 1.0
+    }
+
+    #[test]
+    fn parse_sync_scale_honours_values_in_range() {
+        assert_eq!(parse_sync_scale("0.88"), 0.88);
+        assert_eq!(parse_sync_scale("2"), 2.0);
+        assert_eq!(parse_sync_scale(" 0.5 "), 0.5);
+    }
+
+    #[test]
+    fn parse_sync_scale_falls_back_to_default_when_invalid() {
+        for raw in ["0", "-0.5", "2.5", "abc", "nan", "inf"] {
+            assert_eq!(parse_sync_scale(raw), SYNC_SCALE_DEFAULT, "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_device_env_reads_the_key_from_helper_output() {
+        let output = "ARMADA_DEVICE_ID=retroid-pocket-6\nARMADA_RGB_SYNC_SCALE=0.88\nARMADA_IRQ_CORES=3-7\n";
+        assert_eq!(
+            parse_device_env(output, "ARMADA_RGB_SYNC_SCALE").as_deref(),
+            Some("0.88")
+        );
+        // A prefix of another key must not match.
+        assert_eq!(parse_device_env("ARMADA_RGB_SYNC_SCALE_X=1\n", "ARMADA_RGB_SYNC_SCALE"), None);
+    }
+
+    #[test]
+    fn parse_device_env_treats_unset_key_as_absent() {
+        // device-env prints every whitelisted key; an unset one is `KEY=''`.
+        assert_eq!(parse_device_env("ARMADA_RGB_SYNC_SCALE=''\n", "ARMADA_RGB_SYNC_SCALE"), None);
+        assert_eq!(parse_device_env("ARMADA_DEVICE_ID=x\n", "ARMADA_RGB_SYNC_SCALE"), None);
+        assert_eq!(
+            parse_device_env("ARMADA_RGB_SYNC_SCALE='0.9'\n", "ARMADA_RGB_SYNC_SCALE").as_deref(),
+            Some("0.9")
+        );
     }
 
     #[test]
@@ -1150,6 +1279,7 @@ mod tests {
         let mut state: EffectState = EffectState {
             backlight_root: root,
             backlight_name: None,
+            sync_scale: 0.88, // the RP6 device-env value
             ..EffectState::default()
         };
         assert_eq!(state.scale_for_sync(100, true), 79); // 90% backlight * 0.88 (QG-5)
@@ -1164,6 +1294,7 @@ mod tests {
         let mut state: EffectState = EffectState {
             backlight_root: root,
             backlight_name: Some("backlight".into()),
+            sync_scale: 0.88, // the RP6 device-env value
             ..EffectState::default()
         };
         assert_eq!(state.scale_for_sync(100, true), 9); // 10% backlight * 0.88 (QG-5)
@@ -1175,6 +1306,7 @@ mod tests {
         let mut state: EffectState = EffectState {
             backlight_root: root,
             backlight_name: None,
+            sync_scale: 0.88, // the RP6 device-env value
             ..EffectState::default()
         };
         assert_eq!(state.scale_for_sync(55, true), 48); // 55 * 1.0 (no backlight) * 0.88 (QG-5)

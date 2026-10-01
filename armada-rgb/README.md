@@ -90,6 +90,15 @@ candidate); if a device ever exposes *more than one* non-generic candidate
 `run` logs a one-time diagnostic naming every candidate and which one it
 picked, rather than staying silent about it.
 
+Some LEDs read brighter than the panel at the same backlight level, so the
+scaled value is also multiplied by a per-device factor, `ARMADA_RGB_SYNC_SCALE`
+(`0.88` on the Retroid Pocket 6). It is HW-dependent, so it lives in the
+device `.conf` of the OS: `run` reads it from the device-env helper
+(`/usr/libexec/armada/device-env`, or the path in `ARMADA_DEVICE_ENV`); an
+`ARMADA_RGB_SYNC_SCALE` set in the process environment takes precedence. With
+no key the factor is `1.0`; a value outside `(0, 2]` or not a number also
+falls back to `1.0` and logs an `[armada-rgb]` warning.
+
 ### `screen_sync`
 
 Captures the screen with `gamescopectl screenshot <path>` and paints the

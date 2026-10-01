@@ -65,6 +65,18 @@ impl Fixture {
         fs::write(path.join("brightness"), "unchanged\n").unwrap();
     }
 
+    /// A stand-in for /usr/libexec/armada/device-env that prints `lines`.
+    fn device_env(&self, lines: &str) -> PathBuf {
+        let path: PathBuf = self.root.join("device-env");
+        fs::write(
+            &path,
+            format!("#!/bin/sh\ncat <<'EOF'\nARMADA_DEVICE_ID=test\n{lines}\nEOF\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     fn value(&self, target: &str, attribute: &str) -> String {
         fs::read_to_string(self.leds.join(target).join(attribute))
             .unwrap()
@@ -363,8 +375,13 @@ fn sync_brightness_cli_toggle_persists_and_run_scales_on_top_of_static() {
     fs::write(backlight_root.join("panel/brightness"), "50\n").unwrap();
     fs::write(backlight_root.join("panel/max_brightness"), "100\n").unwrap();
 
+    // The LED-vs-screen factor reaches the daemon the way it does on the
+    // device: through the OS device-env helper, not a hard-coded constant.
+    let device_env: PathBuf = fixture.device_env("ARMADA_RGB_SYNC_SCALE=0.88");
     let with_backlight_env = |command: &mut Command| {
         command
+            .env_remove("ARMADA_RGB_SYNC_SCALE")
+            .env("ARMADA_DEVICE_ENV", &device_env)
             .env("ARMADA_RGB_BACKLIGHT_ROOT", &backlight_root)
             .env("ARMADA_RGB_BACKLIGHT_NAME", "panel");
     };
@@ -411,6 +428,92 @@ fn sync_brightness_cli_toggle_persists_and_run_scales_on_top_of_static() {
     let _ = daemon.wait();
 
     assert_eq!(fixture.value("rgb:l1", "brightness"), "204"); // scale(80, 255), unscaled
+}
+
+/// Run the daemon briefly with a static 80% green, sync-brightness on and a
+/// 50% backlight; return (LED brightness written, daemon stderr).
+fn run_synced_static(device_env: Option<&str>) -> (String, String) {
+    let fixture: Fixture = Fixture::new();
+    fixture.target("rgb:l1", "blue green red", "255");
+    let backlight_root: PathBuf = fixture.root.join("backlight");
+    fs::create_dir_all(backlight_root.join("panel")).unwrap();
+    fs::write(backlight_root.join("panel/brightness"), "50\n").unwrap();
+    fs::write(backlight_root.join("panel/max_brightness"), "100\n").unwrap();
+
+    for args in [
+        &["set", "--color", "00FF00", "--brightness", "80"][..],
+        &["sync-brightness", "on"][..],
+    ] {
+        let output = fixture
+            .command("multicolor", &["rgb:l1"], None)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let helper: PathBuf = match device_env {
+        Some(lines) => fixture.device_env(lines),
+        None => fixture.root.join("no-such-device-env"),
+    };
+    let mut command: Command = fixture.command("multicolor", &["rgb:l1"], None);
+    let mut daemon: std::process::Child = command
+        .env_remove("ARMADA_RGB_SYNC_SCALE")
+        .env("ARMADA_DEVICE_ENV", &helper)
+        .env("ARMADA_RGB_BACKLIGHT_ROOT", &backlight_root)
+        .env("ARMADA_RGB_BACKLIGHT_NAME", "panel")
+        .arg("run")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let _ = daemon.kill();
+    let output = daemon.wait_with_output().unwrap();
+    (
+        fixture.value("rgb:l1", "brightness"),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn sync_scale_comes_from_device_env() {
+    // 0.88: round(80 * 50% * 0.88) = 35 -> scale(35, 255) = 89.
+    let (brightness, _) = run_synced_static(Some("ARMADA_RGB_SYNC_SCALE=0.88"));
+    assert_eq!(brightness, "89");
+    // Any other device value is honored: round(80 * 50% * 0.5) = 20 -> 51.
+    let (brightness, _) = run_synced_static(Some("ARMADA_RGB_SYNC_SCALE=0.5"));
+    assert_eq!(brightness, "51");
+}
+
+#[test]
+fn sync_scale_defaults_to_unscaled_without_device_key() {
+    // No helper, or a helper that leaves the key unset: factor 1.0, so
+    // round(80 * 50%) = 40 -> scale(40, 255) = 102, and no warning.
+    for device_env in [None, Some("ARMADA_RGB_SYNC_SCALE=''")] {
+        let (brightness, stderr) = run_synced_static(device_env);
+        assert_eq!(brightness, "102", "{device_env:?}");
+        assert!(
+            !stderr.contains("ARMADA_RGB_SYNC_SCALE"),
+            "{device_env:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn invalid_sync_scale_falls_back_to_default_with_warning() {
+    for value in ["0", "3", "bright"] {
+        let (brightness, stderr) =
+            run_synced_static(Some(&format!("ARMADA_RGB_SYNC_SCALE={value}")));
+        assert_eq!(brightness, "102", "{value}");
+        assert!(
+            stderr.contains("[armada-rgb] ARMADA_RGB_SYNC_SCALE="),
+            "{value}: {stderr}"
+        );
+    }
 }
 
 #[test]
