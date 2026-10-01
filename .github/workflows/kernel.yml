@@ -1,7 +1,7 @@
 name: kernel
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths: ['kernel/**', 'oci/**', '.github/workflows/kernel.yml', '.github/workflows/_package-image.yml', 'toolchain.env']
   workflow_dispatch:
     inputs:
@@ -19,4 +19,19 @@ jobs:
     secrets: inherit
     with:
       package: kernel
-      branch: ${{ inputs.branch || '' }}
+      branch: ${{ inputs.branch || (github.ref_name == 'develop' && 'develop') || '' }}
+  # A develop publish rebuilds the RP6 OS image so the change reaches devices on :latest.
+  dispatch-image:
+    needs: build
+    if: github.ref_name == 'develop' || inputs.branch == 'develop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger armada-rp6 image build
+        env:
+          GH_TOKEN: ${{ secrets.RP6_CI_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::[CI] RP6_CI_TOKEN is not set; run the armada-rp6 build by hand."
+            exit 0
+          fi
+          gh workflow run build.yml -R ${{ github.repository_owner }}/armada-rp6 --ref develop
